@@ -1,0 +1,734 @@
+#!/usr/bin/env -S gor run
+
+/*
+Gor Template
+
+Seed for new gor-powered CLI tools based on the shared patterns in
+image-compress-resize, pdf-compress, and video-compress-resize.
+
+The default implementation copies each input to a sibling `-out` path so the
+full batch/reporting flow works before you replace the app-specific hooks.
+
+Usage:
+	gor-template -h
+	gor-template stat [--ci] [paths...]
+	gor-template process [files...]
+
+Code Standards:
+	- Commands that shell out to non-bundled binaries should check PATH, print install hints, and
+	  exit non-zero when required commands are missing.
+	- Multi-word identifiers:
+	  - order from general to specific (head-first: main concept, then qualifier)
+	  - typically topic -> optional subtype/format -> measured attribute -> limit/qualifier
+	  - e.g. appStatusOK, not okAppStatus
+	  - exported names use PascalCase; unexported names use camelCase
+	- Struct field names:
+	  - minimal tokens within the owning type
+	  - no repeated type/package/domain prefixes unless required for disambiguation
+	- Package-level declarations (except imports) should be
+	  - documented with a Go doc comment above each exported name; document unexported helpers when
+	    the behavior is non-obvious
+	  - sorted alphabetically by identifier (consts, var, type, func, fields inside exported objects,
+	    vars, then functions)
+	  - prefixed with a short domain token for stat features (here ``stat``); else ``core`` for
+	    all else unless there is a language requirement to do so.
+	  - every package-level function and method name uses the ``stat`` or ``core`` prefix; the only
+	    routine exception is ``main``, which Go requires for the program entry point.
+	- Functions:
+	  - exported functions and methods must have a Go doc comment; leave a blank line between
+	    functions
+	  - entry points and orchestration read top-down as a short sequence of named steps; keep the
+	    happy path obvious and move mechanics into helpers with intent-revealing names
+	- Helper placement:
+	  - prefer small function literals (closures) only for tiny logic tightly coupled to one block
+	  - promote helpers to package-level unexported functions when nesting makes the caller hard to
+	    scan, even if the helper currently has one call site
+	  - shared by 2+ call sites -> smallest common scope (usually an unexported func in the same
+	    package)
+	  - must be visible to tests or other packages -> place it at the narrowest scope that
+	    satisfies that visibility
+	  - mutual recursion -> package-level funcs as the language requires
+	- Parameter shape:
+	  - if a function takes more than four primitive or config parameters, prefer an options struct
+	  - if the same cluster of values passes through multiple layers, define a named type for it
+	- Branching:
+	  - materially different pipelines -> separate helpers, not interleaved
+	  - repeated status literals and sentinels -> centralized const blocks (or typed constants when
+	    suitable)
+	- Assume a Unix-like environment and POSIX features are available.
+	- Prefer the Go standard library when it fits; add third-party modules via go.mod / go get.
+	- Use Cobra for CLI wiring and command trees.
+	  - default to no shortened flags for newly added options
+	- Run gofmt (and go vet where practical). Prefer soft line length around 100 characters unless
+	  the line is a long string literal or a URL.
+
+Completions:
+	For the ``gor`` runner (cligen-style help), add after ``compinit`` in ``~/.zshrc``:
+	compdef _gnu_generic gor
+*/
+
+package main
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+const (
+	appOutputSuffix = "-out"
+	appStatusFailed = "failed"
+	// appStatusProcessed is stored in appResult.status after a successful copy (or dry-run stand-in).
+	appStatusProcessed = "processed"
+	appStatusSkipped   = "skipped"
+	appTitle           = "Gor Template"
+	appUse             = "gor-template"
+	statStatusFailed  = "failed"
+	statStatusOK      = "ok"
+	statStatusSkipped = "skipped"
+)
+
+// appOptions holds persistent CLI flags for the process workflow.
+type appOptions struct {
+	dryRun       bool
+	noInput      bool
+	outputSuffix string
+	replace      bool
+	trash        bool
+	yes          bool
+}
+
+// appResult is one row of process output: paths, status, byte sizes, optional note, and timing.
+type appResult struct {
+	bytesAfter     int64
+	bytesBefore    int64
+	destination    string
+	elapsedSeconds float64
+	message        string
+	source         string
+	status         string
+}
+
+// appSummary aggregates process results for a batch run.
+type appSummary struct {
+	name    string
+	results []appResult
+}
+
+// statRow is one line of stat output: path, size, mtime, outcome, and optional detail.
+type statRow struct {
+	modTime   string
+	message   string
+	path      string
+	sizeBytes int64
+	status    string
+}
+
+// coreCommandAvailable reports whether the given name resolves to an executable on PATH.
+func coreCommandAvailable(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+// coreConfirmPrompt asks a y/n question and returns the default on empty or unreadable input.
+func coreConfirmPrompt(message string, defaultValue bool) bool {
+	defaultLabel := "y/N"
+	if defaultValue {
+		defaultLabel = "Y/n"
+	}
+	fmt.Fprintf(os.Stdout, "%s [%s]: ", message, defaultLabel)
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return defaultValue
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	case "n", "no":
+		return false
+	case "":
+		return defaultValue
+	default:
+		return defaultValue
+	}
+}
+
+// coreCopyFile copies bytes from source to destination, replacing destination if present.
+func coreCopyFile(source, destination string) error {
+	from, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer from.Close()
+
+	to, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(to, from); err != nil {
+		_ = to.Close()
+		return err
+	}
+	return to.Close()
+}
+
+// coreCopyTimestamp sets destination modification time to match source.
+func coreCopyTimestamp(source, destination string) error {
+	stat, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	return os.Chtimes(destination, stat.ModTime(), stat.ModTime())
+}
+
+// coreEnsureParentDir creates the parent directory of path if it does not exist.
+func coreEnsureParentDir(path string) error {
+	return os.MkdirAll(filepath.Dir(path), 0o755)
+}
+
+// coreExists reports whether path is stat-able without error.
+func coreExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// coreFileSize returns size in bytes from stat, or zero if stat fails.
+func coreFileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// coreIsTTY reports whether stdin and stdout appear to be interactive character devices.
+func coreIsTTY() bool {
+	stdinInfo, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	stdoutInfo, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return stdinInfo.Mode()&os.ModeCharDevice != 0 && stdoutInfo.Mode()&os.ModeCharDevice != 0
+}
+
+// coreBytesToMiB converts a byte count to mebibytes for display.
+func coreBytesToMiB(size int64) float64 {
+	return float64(size) / 1024.0 / 1024.0
+}
+
+// coreCommandsMissing returns the subset of the given commands that are not available on PATH.
+func coreCommandsMissing(commands []string) []string {
+	missing := make([]string, 0, len(commands))
+	for _, command := range commands {
+		if !coreCommandAvailable(command) {
+			missing = append(missing, command)
+		}
+	}
+	return missing
+}
+
+// corePrintRows writes a left-padded column table of headers and rows to out.
+func corePrintRows(out io.Writer, headers []string, rows [][]string) {
+	widths := make([]int, len(headers))
+	for i, header := range headers {
+		widths[i] = len(header)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			if len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+	for i, header := range headers {
+		fmt.Fprintf(out, "%-*s  ", widths[i], header)
+	}
+	fmt.Fprintln(out)
+	for _, row := range rows {
+		for i, cell := range row {
+			fmt.Fprintf(out, "%-*s  ", widths[i], cell)
+		}
+		fmt.Fprintln(out)
+	}
+}
+
+// corePromptLine writes message to stdout and reads one line from stdin, trimmed of surrounding space.
+func corePromptLine(message string) (string, error) {
+	fmt.Fprintf(os.Stdout, "%s: ", message)
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
+// coreRunCommand runs an external program with stdout and stderr attached to the process.
+func coreRunCommand(name string, args []string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s failed: %w", name, err)
+	}
+	return nil
+}
+
+// coreDoctorCommand constructs the doctor subcommand that prints dependency status.
+func coreDoctorCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "doctor",
+		Short: "Show detected dependencies and their status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fmt.Fprintln(cmd.OutOrStdout(), "App dependencies")
+			corePrintRows(cmd.OutOrStdout(), []string{"Dependency", "Status", "Details"}, statDoctorRows())
+			return nil
+		},
+	}
+}
+
+// coreFlagsNonDefault reports whether any persistent flag differs from defaults so the root can run without args.
+func coreFlagsNonDefault(opts *appOptions) bool {
+	return opts.trash || opts.replace || opts.dryRun || opts.yes || opts.noInput || opts.outputSuffix != appOutputSuffix
+}
+
+// coreProcessCommand constructs the process subcommand that uses the shared batch run path.
+func coreProcessCommand(opts *appOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:   "process [files...]",
+		Short: "Process one or more files",
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return coreRunProcess(cmd, args, opts)
+		},
+	}
+}
+
+// coreRootCommand builds the root command with persistent flags, default routing, and subcommands.
+func coreRootCommand() *cobra.Command {
+	opts := &appOptions{outputSuffix: appOutputSuffix}
+	cmd := &cobra.Command{
+		Use:           appUse,
+		Short:         "Seed for new gor-powered CLI tools",
+		Long: "Seed for new gor-powered CLI tools with Cobra wiring, batch process, stat, doctor, interactive prompts, and summary reporting.",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 && !coreFlagsNonDefault(opts) {
+				return cmd.Help()
+			}
+			return coreRunProcess(cmd, args, opts)
+		},
+	}
+	cmd.SetOut(os.Stdout)
+	cmd.SetErr(os.Stderr)
+	cmd.PersistentFlags().BoolVar(&opts.trash, "trash", false, "Move originals to the Trash after processing")
+	cmd.PersistentFlags().BoolVar(&opts.replace, "replace", false, "Replace originals after processing")
+	cmd.PersistentFlags().BoolVar(&opts.dryRun, "dry-run", false, "Show what would happen without writing files")
+	cmd.PersistentFlags().BoolVar(&opts.yes, "yes", false, "Skip interactive confirmations")
+	cmd.PersistentFlags().BoolVar(&opts.noInput, "no-input", false, "Do not prompt for missing files or confirmations")
+	cmd.PersistentFlags().StringVar(&opts.outputSuffix, "suffix", appOutputSuffix, "Suffix to add before the output file extension")
+	cmd.AddCommand(coreDoctorCommand())
+	cmd.AddCommand(coreProcessCommand(opts))
+	cmd.AddCommand(statCommand())
+	return cmd
+}
+
+// coreSummaryHasFailures reports whether any result in the summary has status appStatusFailed.
+func (s appSummary) coreSummaryHasFailures() bool {
+	for _, result := range s.results {
+		if result.status == appStatusFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// corePrintProcessRow emits a single-line ok, skip, or fail line for one process result.
+func corePrintProcessRow(out io.Writer, result appResult) {
+	switch result.status {
+	case appStatusProcessed:
+		message := ""
+		if result.message != "" {
+			message = " " + result.message
+		}
+		delta := coreBytesToMiB(result.bytesAfter - result.bytesBefore)
+		fmt.Fprintf(out, "ok %s -> %s (%.2f MB -> %.2f MB, delta %.2f MB)%s\n",
+			result.source, result.destination,
+			coreBytesToMiB(result.bytesBefore), coreBytesToMiB(result.bytesAfter),
+			delta, message)
+	case appStatusSkipped:
+		fmt.Fprintf(out, "skip %s: %s\n", result.source, result.message)
+	default:
+		fmt.Fprintf(out, "fail %s: %s\n", result.source, result.message)
+	}
+}
+
+// corePrintProcessSummary writes aggregate counts and byte totals for the batch to out.
+func corePrintProcessSummary(out io.Writer, summary appSummary) {
+	processed, skipped, failed := 0, 0, 0
+	var totalBytesBefore, totalBytesAfter int64
+	for _, result := range summary.results {
+		totalBytesBefore += result.bytesBefore
+		totalBytesAfter += result.bytesAfter
+		switch result.status {
+		case appStatusProcessed:
+			processed++
+		case appStatusSkipped:
+			skipped++
+		case appStatusFailed:
+			failed++
+		}
+	}
+	fmt.Fprintln(out, "Summary")
+	fmt.Fprintf(out, "  Processed: %d\n", processed)
+	fmt.Fprintf(out, "  Skipped: %d\n", skipped)
+	fmt.Fprintf(out, "  Failed: %d\n", failed)
+	fmt.Fprintf(out, "  Original MB: %.2f\n", coreBytesToMiB(totalBytesBefore))
+	fmt.Fprintf(out, "  Output MB: %.2f\n", coreBytesToMiB(totalBytesAfter))
+	fmt.Fprintf(out, "  Delta MB: %.2f\n", coreBytesToMiB(totalBytesAfter-totalBytesBefore))
+}
+
+// coreProcessFile handles one path: skip rules, copy output, timestamps, and optional replace or trash.
+func coreProcessFile(source string, opts *appOptions) appResult {
+	info, err := os.Stat(source)
+	if err != nil || info.IsDir() {
+		return appResult{source: source, status: appStatusSkipped, message: "not found"}
+	}
+	if err := coreValidateSource(source); err != nil {
+		return appResult{source: source, status: appStatusSkipped, message: err.Error()}
+	}
+
+	destination := statOutputPath(source, opts.outputSuffix)
+	if coreExists(destination) {
+		return appResult{source: source, destination: destination, status: appStatusSkipped, message: filepath.Base(destination) + " already exists"}
+	}
+
+	bytesBefore := coreFileSize(source)
+	if opts.dryRun {
+		return appResult{
+			source: source, destination: destination, status: appStatusProcessed,
+			bytesBefore: bytesBefore, bytesAfter: bytesBefore, message: "dry-run: no file written",
+		}
+	}
+	if err := coreEnsureParentDir(destination); err != nil {
+		return appResult{
+			source: source, destination: destination, status: appStatusFailed,
+			bytesBefore: bytesBefore, message: err.Error(),
+		}
+	}
+	if err := coreProcessPayload(source, destination, opts); err != nil {
+		return appResult{
+			source: source, destination: destination, status: appStatusFailed,
+			bytesBefore: bytesBefore, message: err.Error(),
+		}
+	}
+	if !coreExists(destination) {
+		return appResult{
+			source: source, destination: destination, status: appStatusFailed,
+			bytesBefore: bytesBefore, message: "processor did not write the destination file",
+		}
+	}
+	if err := coreCopyTimestamp(source, destination); err != nil {
+		return appResult{
+			source: source, destination: destination, status: appStatusFailed,
+			bytesBefore: bytesBefore, message: err.Error(),
+		}
+	}
+
+	bytesAfter := coreFileSize(destination)
+	result := appResult{
+		source: source, destination: destination, status: appStatusProcessed,
+		bytesBefore: bytesBefore, bytesAfter: bytesAfter,
+	}
+	if opts.replace {
+		if err := os.Remove(source); err != nil {
+			result.status = appStatusFailed
+			result.message = err.Error()
+			return result
+		}
+		if err := os.Rename(destination, source); err != nil {
+			result.status = appStatusFailed
+			result.message = err.Error()
+			return result
+		}
+		result.destination = source
+	} else if opts.trash {
+		if err := coreRunCommand("trash", []string{source}); err != nil {
+			result.status = appStatusFailed
+			result.message = err.Error()
+			return result
+		}
+	}
+	return result
+}
+
+// coreProcessPayload performs tool-specific work from source to destination; override for real behavior.
+func coreProcessPayload(source, destination string, opts *appOptions) error {
+	_ = opts
+	return coreCopyFile(source, destination)
+}
+
+// coreResolveInputs returns CLI args as-is or prompts interactively for paths when appropriate.
+func coreResolveInputs(args []string, opts *appOptions) ([]string, error) {
+	if len(args) > 0 {
+		return args, nil
+	}
+	if opts.noInput || !coreIsTTY() {
+		return nil, nil
+	}
+	answer, err := corePromptLine("Enter one or more files, separated by spaces or commas")
+	if err != nil {
+		return nil, err
+	}
+	if answer == "" {
+		return nil, nil
+	}
+	fields := strings.FieldsFunc(answer, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	resolved := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if trimmed := strings.TrimSpace(field); trimmed != "" {
+			resolved = append(resolved, trimmed)
+		}
+	}
+	return resolved, nil
+}
+
+// coreRunProcess validates the environment, resolves inputs, runs the batch, and errors if any file failed.
+func coreRunProcess(cmd *cobra.Command, args []string, opts *appOptions) error {
+	if err := coreValidateRuntime(opts); err != nil {
+		return err
+	}
+
+	files, err := coreResolveInputs(args, opts)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return errors.New("provide one or more files")
+	}
+	if opts.replace && !opts.yes && coreIsTTY() {
+		if !coreConfirmPrompt("Replace the original files after processing?", false) {
+			return errors.New("no usable files were provided")
+		}
+	}
+
+	fmt.Fprintln(cmd.OutOrStdout(), appTitle)
+	fmt.Fprintln(cmd.OutOrStdout(), "Default seed workflow with batch reporting, timestamps, and doctor output")
+	summary := coreRunProcessBatch(cmd.OutOrStdout(), files, opts)
+	corePrintProcessSummary(cmd.OutOrStdout(), summary)
+	if summary.coreSummaryHasFailures() {
+		return errors.New("one or more files failed")
+	}
+	return nil
+}
+
+// coreRunProcessBatch processes each file, appends results, and prints per-file status to out.
+func coreRunProcessBatch(out io.Writer, files []string, opts *appOptions) appSummary {
+	summary := appSummary{name: appTitle}
+	for _, source := range files {
+		started := time.Now()
+		result := coreProcessFile(source, opts)
+		result.elapsedSeconds = time.Since(started).Seconds()
+		summary.results = append(summary.results, result)
+		corePrintProcessRow(out, result)
+	}
+	return summary
+}
+
+// coreValidateRuntime checks required tools, flag consistency, and trash availability when needed.
+func coreValidateRuntime(opts *appOptions) error {
+	missing := coreCommandsMissing(statRequiredCommands())
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required commands: %s (install them and ensure they are on PATH)", strings.Join(missing, ", "))
+	}
+	if opts.outputSuffix == "" {
+		return errors.New("suffix must not be empty")
+	}
+	if opts.trash || opts.replace {
+		if !coreCommandAvailable("trash") {
+			return errors.New("trash command is required when using --trash or --replace")
+		}
+	}
+	return nil
+}
+
+// coreValidateSource rejects inputs that should be skipped before processing; override for file-type rules.
+func coreValidateSource(source string) error {
+	_ = source
+	return nil
+}
+
+// statCommand constructs the stat subcommand that prints size and mtime for each regular file.
+func statCommand() *cobra.Command {
+	var ci bool
+	cmd := &cobra.Command{
+		Use:   "stat [paths...]",
+		Short: "Print size and last-write time for each regular file",
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return statRun(cmd, args, ci)
+		},
+	}
+	cmd.Flags().BoolVar(&ci, "ci", false, "CI mode: if argv has no paths, exit instead of prompting on a TTY")
+	return cmd
+}
+
+// statDoctorRows returns table rows describing required and optional external commands for doctor output.
+func statDoctorRows() [][]string {
+	rows := [][]string{}
+	commands := statRequiredCommands()
+	if len(commands) == 0 {
+		rows = append(rows, []string{"(none)", "ok", "default app implementation only uses Go stdlib file copy"})
+	} else {
+		for _, command := range commands {
+			if coreCommandAvailable(command) {
+				rows = append(rows, []string{command, "ok", "available"})
+			} else {
+				rows = append(rows, []string{command, "missing", "install before running this tool"})
+			}
+		}
+	}
+	if coreCommandAvailable("trash") {
+		rows = append(rows, []string{"trash", "ok", "available for --trash / --replace"})
+	} else {
+		rows = append(rows, []string{"trash", "optional", "only needed for trash or replace flows"})
+	}
+	return rows
+}
+
+// statRowFromPath fills a statRow with size and mtime for one path, or skip/fail status.
+func statRowFromPath(path string) statRow {
+	row := statRow{path: path}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			row.status = statStatusSkipped
+			row.message = "no such file"
+			return row
+		}
+		row.status = statStatusFailed
+		row.message = err.Error()
+		return row
+	}
+	if info.IsDir() {
+		row.status = statStatusSkipped
+		row.message = "path is a directory, not a regular file"
+		return row
+	}
+	row.status = statStatusOK
+	row.sizeBytes = info.Size()
+	row.modTime = info.ModTime().Format("2006-01-02 15:04:05 -07:00")
+	return row
+}
+
+// statResolveInputs returns CLI paths as-is, or prompts on a TTY when argv has no paths and CI mode is off.
+func statResolveInputs(args []string, ci bool) ([]string, error) {
+	if len(args) > 0 {
+		return args, nil
+	}
+	if ci || !coreIsTTY() {
+		return nil, nil
+	}
+	answer, err := corePromptLine("Enter one or more file paths, separated by spaces or commas")
+	if err != nil {
+		return nil, err
+	}
+	if answer == "" {
+		return nil, nil
+	}
+	fields := strings.FieldsFunc(answer, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	resolved := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if trimmed := strings.TrimSpace(field); trimmed != "" {
+			resolved = append(resolved, trimmed)
+		}
+	}
+	return resolved, nil
+}
+
+// statOutputPath returns a sibling path with suffix inserted before the file extension.
+func statOutputPath(path, suffix string) string {
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	return filepath.Join(filepath.Dir(path), stem+suffix+ext)
+}
+
+// statRequiredCommands lists external executable names that must be on PATH; nil when none are required.
+func statRequiredCommands() []string {
+	return nil
+}
+
+// statPrintRow writes one human-readable line for a stat row (ok, skip, or fail).
+func statPrintRow(out io.Writer, r statRow) {
+	switch r.status {
+	case statStatusOK:
+		mib := coreBytesToMiB(r.sizeBytes)
+		fmt.Fprintf(out, "%s  %d bytes  (%.2f MiB)  mtime %s\n", r.path, r.sizeBytes, mib, r.modTime)
+	case statStatusSkipped:
+		fmt.Fprintf(out, "skip %s: %s\n", r.path, r.message)
+	default:
+		fmt.Fprintf(out, "fail %s: %s\n", r.path, r.message)
+	}
+}
+
+// statRun resolves inputs, stats each path, prints lines, returns an error if any path failed, and exits 130 on interrupt.
+func statRun(cmd *cobra.Command, args []string, ci bool) error {
+	interruptCh := make(chan os.Signal, 1)
+	signal.Notify(interruptCh, os.Interrupt)
+	defer signal.Stop(interruptCh)
+
+	paths, err := statResolveInputs(args, ci)
+	if err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return errors.New("provide one or more paths")
+	}
+	out := cmd.OutOrStdout()
+	anyFailed := false
+	for _, p := range paths {
+		select {
+		case <-interruptCh:
+			fmt.Fprintln(cmd.ErrOrStderr(), "")
+			fmt.Fprintln(cmd.ErrOrStderr(), "Interrupted.")
+			os.Exit(130)
+		default:
+		}
+		row := statRowFromPath(p)
+		statPrintRow(out, row)
+		if row.status == statStatusFailed {
+			anyFailed = true
+		}
+	}
+	if anyFailed {
+		return errors.New("one or more paths failed")
+	}
+	return nil
+}
+
+// Main is the program entry point: runs the root Cobra command and exits with status 1 when Execute returns an error.
+func main() {
+	if err := coreRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
