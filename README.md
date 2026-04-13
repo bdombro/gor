@@ -16,6 +16,7 @@ gor -h
 gor run -h
 gor run script.go [args...]
 gor cacheClear
+gor completions-zsh
 ```
 
 Use `gor run -h` only when there is no script path (otherwise `-h` is passed through to your program).
@@ -36,32 +37,38 @@ rm gor.zip
 
 Assumes `~/.local/bin` is on your `PATH`.
 
-From a clone, build and install the binary and (when zsh’s completion system is available) register **cligen-style** zsh completion in `~/.zshrc`:
+From a clone, build and install the binary to `~/.local/bin/gor` and write a zsh completion file:
 
 ```sh
 just install
 # or: ./scripts/install.sh
 ```
 
-That copies `dist/gor` to `~/.local/bin/gor`. If `zsh` is on `PATH` and `compdef` works after `compinit` in a clean zsh, the script appends `compdef _gnu_generic gor` to `~/.zshrc` when that line is not already present (or creates a minimal `~/.zshrc` with `compinit` plus that `compdef` if the file did not exist). Otherwise it prints a short message and skips editing `~/.zshrc` without failing the install.
+That copies `dist/gor` to `~/.local/bin/gor`, then runs `gor completions-zsh`, which writes `~/.zsh/completions/_gor` (creating `~/.zsh/completions/` if needed, or replacing `_gor` if it already exists). The install script does **not** edit `~/.zshrc`; you must put that directory on zsh `fpath` **before** `compinit` (see below).
 
 
 ## Completions
 
-### Zsh (cligen / GNU-style long options)
+### Zsh (file-based `_gor`)
 
-cligen’s help tables match zsh’s **`_gnu_generic`** completer (long flags from `--help`; not a custom subcommand-aware completion script).
+Generate or refresh the completion script:
 
-Put **`compinit` before `compdef`** in `~/.zshrc`, for example:
-
-```zsh
-autoload -Uz compinit && compinit
-compdef _gnu_generic gor
+```sh
+gor completions-zsh
 ```
 
-If you use **Oh My Zsh** or similar, `compinit` is usually already loaded; then only `compdef _gnu_generic gor` is needed (after that initialization).
+This installs `~/.zsh/completions/_gor`. If the directory did not exist, `gor` prints a warning when it creates it.
 
-**Release binary only:** add the same two lines yourself, or run `./scripts/install.sh` from a clone so the script can update `~/.zshrc` when the zsh check passes.
+Put **`~/.zsh/completions` on `fpath` before `compinit`**. For example in `~/.zshrc`:
+
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+If you use **Oh My Zsh**, add the `fpath` line before Oh My Zsh is sourced (or wherever your theme loads `compinit`).
+
+**Release binary only:** run `gor completions-zsh` after installing the binary, then configure `fpath` as above.
 
 **Refresh if TAB seems stale**
 

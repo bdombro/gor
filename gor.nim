@@ -9,6 +9,7 @@
     gor run -h
     gor run script.go [args...]
     gor cacheClear
+    gor completions-zsh
 
   ``gor run -h`` applies only when no script path is given (otherwise ``-h`` is forwarded to the
   compiled program).
@@ -49,58 +50,99 @@
       - materially different pipelines → separate helpers, not interleaved
       - repeated status literals and sentinels → centralized constants (or enums when suitable)
     - Assume unix arch and POSIX features are available
-    - Use cligen for CLI features (declare it in ``gor.nimble`` / your package manager)
+    - Use argsbarg for CLI features (declare it in ``gor.nimble`` / your package manager)
       - default to no shortened flags for newly added options
     - Local dev build for this repo: ``just`` / ``justfile`` (needs ``nim`` + ``nimble`` on PATH)
     - Use line max-width of 100 characters, unless the line is a code block or a URL
+    - ``CliCommand.handler`` must be a named proc, not an inline proc literal, and must implement
+      the command directly rather than just forwarding to another proc
 ]#
 
-import std/[os, osproc, strutils, tables]
-import cligen
-import cligen/humanUt
+import std/[options, os, osproc, strutils]
+import argsbarg
 
 {.push warning[Deprecated]: off.}
 import std/sha1
 {.pop.}
 
-const
-  ## Cligen help: ``doc`` then options only (no ``$command`` / ``$args`` synopsis).
-  coreUsageTmpl = "${doc}\nOptions:\n$options"
+type
+  ## Zsh completion behavior after a top-level subcommand word (word 2).
+  CoreCliSurfaceZshTail = enum
+    coreCliSurfaceZshTailNone
+    coreCliSurfaceZshTailFiles
+    coreCliSurfaceZshTailNestedWords
+
+type
+  ## One top-level subcommand plus zsh tail behavior and an optional usage line suffix.
+  CoreCliSurfaceTopCmd = object
+    ## Subcommand name offered at ``CURRENT == 2``.
+    name: string
+    ## How zsh completes further tokens under this subcommand.
+    zshTail: CoreCliSurfaceZshTail
+    ## Words offered at ``CURRENT == 3`` when ``zshTail`` is ``coreCliSurfaceZshTailNestedWords``.
+    nestedWords: seq[string]
+    ## Text after ``prog & " "`` for one usage line; empty to omit from usage output.
+    usageLine: string
+
+type
+  ## Declarative CLI surface for zsh completion text and indented usage lines.
+  CoreCliSurfaceSpec = object
+    ## Program name for ``#compdef`` and usage lines.
+    prog: string
+    ## Zsh completion function name including leading underscore.
+    zshFunc: string
+    ## Usage line suffixes (after ``prog & " "``) printed before per-command lines.
+    usagePreamble: seq[string]
+    ## Top-level subcommands (TAB at word 2).
+    topCommands: seq[CoreCliSurfaceTopCmd]
 
 
-var coreClCfg = clCfg
+## Indented usage lines from ``spec.usagePreamble`` and non-empty ``usageLine`` fields.
+proc coreCliSurfaceUsageIndented(spec: CoreCliSurfaceSpec): string =
+  var lines: seq[string]
+  for p in spec.usagePreamble:
+    lines.add("  " & spec.prog & " " & p)
+  for c in spec.topCommands:
+    if c.usageLine.len > 0:
+      lines.add("  " & spec.prog & " " & c.usageLine)
+  lines.join("\n")
 
-## Narrow cligen help table to keys, defaults, and descriptions only.
-coreClCfg.hTabCols = @[clOptKeys, clDflVal, clDescrip]
 
-## Keep top-level ``doc`` line breaks readable (avoid aggressive reflow).
-coreClCfg.wrapDoc = -1
-coreClCfg.wrapTable = -1
-
-## Cligen help ANSI colors; honor ``NO_COLOR`` the same way cligen's config loader does.
-let coreCligenPlain =
-  existsEnv("NO_COLOR") and getEnv("NO_COLOR") notin ["0", "no", "off", "false"]
-let coreCligenAttrOff = if coreCligenPlain: "" else: textAttrOff
-coreClCfg.helpAttr["clOptKeys"] = textAttrOn(@["cyan", "bold"], coreCligenPlain)
-coreClCfg.helpAttrOff["clOptKeys"] = coreCligenAttrOff
-coreClCfg.helpAttr["clValType"] = textAttrOn(@["yellow"], coreCligenPlain)
-coreClCfg.helpAttrOff["clValType"] = coreCligenAttrOff
-coreClCfg.helpAttr["clDflVal"] = textAttrOn(@["green"], coreCligenPlain)
-coreClCfg.helpAttrOff["clDflVal"] = coreCligenAttrOff
-coreClCfg.helpAttr["cmd"] = textAttrOn(@["cyan", "bold"], coreCligenPlain)
-coreClCfg.helpAttrOff["cmd"] = coreCligenAttrOff
-coreClCfg.helpAttr["doc"] = textAttrOn(@["faint"], coreCligenPlain)
-coreClCfg.helpAttrOff["doc"] = coreCligenAttrOff
-
-## ``dispatchMulti`` top-level help uses global ``clCfg`` (``topLevelHelp``); mirror runner cfg.
-clCfg = coreClCfg
+## Builds the zsh completion script body (``#compdef``, function, ``case`` arms, ``_files`` tail).
+proc coreCliSurfaceZshScript(spec: CoreCliSurfaceSpec): string =
+  var names: seq[string]
+  for c in spec.topCommands:
+    names.add(c.name)
+  let compaddLine = names.join(" ")
+  var arms = ""
+  for c in spec.topCommands:
+    arms.add("  ")
+    arms.add(c.name)
+    arms.add(")\n")
+    case c.zshTail
+    of coreCliSurfaceZshTailNone:
+      arms.add("    return 0\n    ;;\n")
+    of coreCliSurfaceZshTailFiles:
+      arms.add("    _files && return 0\n    ;;\n")
+    of coreCliSurfaceZshTailNestedWords:
+      arms.add("    if (( CURRENT == 3 )); then\n      compadd ")
+      arms.add(c.nestedWords.join(" "))
+      arms.add(" && return 0\n    fi\n    ;;\n")
+  result = "#compdef " & spec.prog & "\n\n" & spec.zshFunc & "() {\n"
+  result.add("  if (( CURRENT == 2 )); then\n    compadd ")
+  result.add(compaddLine)
+  result.add("\n    return\n  fi\n  case ${words[2]} in\n")
+  result.add(arms)
+  result.add("  esac\n  _files\n}\n\n")
+  result.add(spec.zshFunc)
+  result.add(" \"$@\"\n")
 
 
 ## Returns the gor cache directory under ``$HOME/.cache/gor``.
 proc cacheDirGorGet(): string =
   let home = getEnv("HOME")
   if home.len == 0:
-    stderr.writeLine "gor: HOME is not set"
+    stderr.writeLine "[gor] HOME is not set"
     quit(1)
   home / ".cache" / "gor"
 
@@ -123,9 +165,86 @@ proc cacheClearRun() =
   try:
     removeDir(dir, checkDir = false)
   except CatchableError as e:
-    stderr.writeLine "gor: could not clear cache: ", e.msg
+    stderr.writeLine "[gor] could not clear cache: ", e.msg
     quit(1)
-  stderr.writeLine "gor: cleared ", dir
+  stderr.writeLine "[gor] cleared ", dir
+
+
+## Writes ``body`` to stdout with a blank line before and after (for ``-h`` / help output).
+## Optional ``docAttrsPrefix`` / ``docAttrsSuffix`` wrap ``body`` (e.g. faint ANSI for no-arg help).
+proc coreCliHelpStdoutWrite(body: string; docAttrsPrefix = ""; docAttrsSuffix = "") =
+  stdout.write '\n'
+  stdout.write docAttrsPrefix
+  stdout.write body
+  stdout.write docAttrsSuffix
+  if not body.endsWith('\n'):
+    stdout.write '\n'
+  stdout.write '\n'
+
+
+## True when ANSI colors should be suppressed (same rule as former cligen config loading).
+proc coreCliPlainGet(): bool =
+  existsEnv("NO_COLOR") and getEnv("NO_COLOR") notin ["0", "no", "off", "false"]
+
+
+## If ``absPath`` starts with ``home`` as a directory prefix, returns tilde form (``~`` + suffix).
+proc corePathDisplayTilde(home, absPath: string): string =
+  if home.len == 0 or absPath.len < home.len:
+    return absPath
+  if not absPath.startsWith(home):
+    return absPath
+  if absPath.len > home.len and absPath[home.len] != DirSep:
+    return absPath
+  if absPath.len == home.len:
+    return "~"
+  "~" & absPath[home.len .. ^1]
+
+
+## Builds an SGR ``on`` sequence from space-separated attribute words, or empty when ``plain``.
+proc coreTextAttrOn(words: openArray[string]; plain: bool): string =
+  if plain:
+    return ""
+  const esc = "\x1b["
+  var parts: seq[string]
+  for w in words:
+    case w
+    of "bold": parts.add "1"
+    of "faint": parts.add "2"
+    of "cyan": parts.add "36"
+    of "green": parts.add "32"
+    of "yellow": parts.add "33"
+    else: discard
+  if parts.len == 0:
+    return ""
+  esc & parts.join(";") & "m"
+
+
+## Resets SGR when not ``plain``.
+proc coreTextAttrOff(plain: bool): string =
+  if plain:
+    ""
+  else:
+    "\x1b[m"
+
+
+## Writes ``contents`` to ``HOME/.zsh/completions/zshFileName``. Warns when the directory is created;
+## prints an ``fpath``/``compinit`` hint only in that case.
+proc coreZshCompletionFileWrite(appBin, zshFileName, contents: string) =
+  let home = getEnv("HOME")
+  if home.len == 0:
+    stderr.writeLine appBin, ": HOME is not set"
+    quit(1)
+  let dir = home / ".zsh" / "completions"
+  let dirExisted = dir.dirExists
+  if not dirExisted:
+    stderr.writeLine appBin, ": warning: ", corePathDisplayTilde(home, dir), " did not exist; creating it"
+    createDir(dir)
+  let path = dir / zshFileName
+  writeFile(path, contents)
+  stdout.writeLine appBin, ": wrote ", corePathDisplayTilde(home, path)
+  if not dirExisted:
+    stdout.writeLine appBin, ": add ", corePathDisplayTilde(home, dir),
+      " to fpath before compinit, then restart zsh or run: compinit"
 
 
 ## Drops a leading shebang so changing only the runner line does not bust the cache.
@@ -147,7 +266,7 @@ proc coreProcessExitCodeWait(cmd: string; args: openArray[string]; workingDir: s
 
 ## Prints help for the ``run`` subcommand (stdout).
 proc coreRunHelpPrint() =
-  stdout.writeLine """
+  coreCliHelpStdoutWrite """
 Compile (if needed) and execute a Go source file. Extra tokens are forwarded to the compiled
 program unchanged.
 
@@ -162,8 +281,8 @@ gor run <script.go> [args...]
 proc runGoCompile(workDir: string; binaryPath: string; hashHex: string): int =
   let goExe = findExe("go")
   if goExe.len == 0:
-    stderr.writeLine "gor: go is not on PATH"
-    stderr.writeLine "gor: install Go: https://go.dev/dl/"
+    stderr.writeLine "[gor] go is not on PATH"
+    stderr.writeLine "[gor] install Go: https://go.dev/dl/"
     quit(1)
   let prefix =
     if hashHex.len >= 8:
@@ -188,17 +307,26 @@ proc runBinaryExec(binary: string; args: openArray[string]) =
   quit(code)
 
 
-## Exported cligen entry for ``cacheClear``.
-proc cacheClear*() =
-  cacheClearRun()
+## Removes the gor content-hash cache directory.
+proc gorCacheClearHandle(ctx: CliContext) =
+  discard ctx
+  let dir = cacheDirGorGet()
+  if not dirExists(dir):
+    return
+  try:
+    removeDir(dir, checkDir = false)
+  except CatchableError as e:
+    stderr.writeLine "[gor] could not clear cache: ", e.msg
+    quit(1)
+  stderr.writeLine "[gor] cleared ", dir
 
 
-## Compiles when the content-hash cache misses, then runs the cached binary.
-## Remaining tokens are forwarded to the compiled program unchanged.
-proc runExecute(scriptAndArgs: seq[string]) =
+## Compiles and runs a Go script.
+proc gorRunHandle(ctx: CliContext) =
+  let scriptAndArgs = ctx.args
 
   if scriptAndArgs.len == 0:
-    stderr.writeLine "gor: run: expected <script> [args...]"
+    stderr.writeLine "[gor] run: expected <script> [args...]"
     quit(1)
 
   let script = scriptAndArgs[0]
@@ -210,7 +338,7 @@ proc runExecute(scriptAndArgs: seq[string]) =
 
   let scriptPath = expandFilename(absolutePath(script))
   if not fileExists(scriptPath):
-    stderr.writeLine "gor: not a file: ", scriptPath
+    stderr.writeLine "[gor] not a file: ", scriptPath
     quit(1)
 
   let raw = readFile(scriptPath)
@@ -237,11 +365,110 @@ proc runExecute(scriptAndArgs: seq[string]) =
   runBinaryExec(binaryPath, args)
 
 
-## Exported cligen entry for ``run`` (listed in top-level help and ``gor help``; normal
-## ``gor run ...`` execution uses the early handler above so flags after the script stay
-## forwarded to the compiled program).
-proc run*(scriptAndArgs: seq[string] = @[]) =
-  runExecute(scriptAndArgs)
+## Compiles when the content-hash cache misses, then runs the cached binary.
+## Remaining tokens are forwarded to the compiled program unchanged.
+proc runExecute(scriptAndArgs: seq[string]) =
+
+  if scriptAndArgs.len == 0:
+    stderr.writeLine "[gor] run: expected <script> [args...]"
+    quit(1)
+
+  let script = scriptAndArgs[0]
+  let args =
+    if scriptAndArgs.len > 1:
+      scriptAndArgs[1 .. ^1]
+    else:
+      @[]
+
+  let scriptPath = expandFilename(absolutePath(script))
+  if not fileExists(scriptPath):
+    stderr.writeLine "[gor] not a file: ", scriptPath
+    quit(1)
+
+  let raw = readFile(scriptPath)
+  let normalized = coreNormalizeForHash(raw)
+  let hashHex = $secureHash(normalized)
+  let binaryPath = cacheBinaryPathGet(hashHex)
+
+  if fileExists(binaryPath):
+    runBinaryExec(binaryPath, args)
+
+  let tmpRoot = getTempDir() / ("gor-build-" & hashHex[0 ..< 16])
+  createDir(tmpRoot)
+  let mainGo = tmpRoot / "main.go"
+  writeFile(mainGo, normalized)
+
+  let code = runGoCompile(tmpRoot, binaryPath, hashHex)
+  try:
+    removeDir(tmpRoot)
+  except CatchableError:
+    discard
+  if code != 0:
+    quit(code)
+
+  runBinaryExec(binaryPath, args)
+
+
+const
+  ## Declarative CLI surface for zsh completion and usage lines.
+  gorCoreCliSurface = CoreCliSurfaceSpec(
+    prog: "gor",
+    zshFunc: "_gor",
+    usagePreamble: @["-h", "run -h"],
+    topCommands: @[
+      CoreCliSurfaceTopCmd(
+        name: "run",
+        zshTail: coreCliSurfaceZshTailFiles,
+        nestedWords: @[],
+        usageLine: "run <script.go> [args...]"),
+      CoreCliSurfaceTopCmd(
+        name: "cacheClear",
+        zshTail: coreCliSurfaceZshTailNone,
+        nestedWords: @[],
+        usageLine: "cacheClear"),
+      CoreCliSurfaceTopCmd(
+        name: "completion",
+        zshTail: coreCliSurfaceZshTailNestedWords,
+        nestedWords: @["zsh"],
+        usageLine: "completions-zsh"),
+    ],
+  )
+  ## Zsh completion script for ``gor`` (from ``gorCoreCliSurface``).
+  gorZshCompletionScript = coreCliSurfaceZshScript(gorCoreCliSurface)
+
+
+let gorCliSchema = CliSchema(
+  commands: @[
+    CliCommand(
+      arguments: @[],
+      commands: @[],
+      description: "Remove the gor content-hash cache directory.",
+      handler: some(gorCacheClearHandle),
+      name: "cacheClear",
+      options: @[],
+    ),
+    CliCommand(
+      arguments: @[
+        CliOption(
+          description: "The Go file to compile and run, followed by forwarded args.",
+          isPositional: true,
+          isRepeated: true,
+          kind: cliValueString,
+          name: "scriptAndArgs",
+        ),
+      ],
+      commands: @[],
+      description: "Compile and run a Go script.",
+      handler: some(gorRunHandle),
+      name: "run",
+      options: @[],
+    ),
+  ],
+  defaultCommand: none(string),
+  description: "Single-file Go runner: content-hash cache, temp module with main.go, go mod init/tidy, go build, then run.",
+  name: "gor",
+  options: @[],
+)
 
 
 when isMainModule:
@@ -250,56 +477,4 @@ when isMainModule:
     if ps.len == 2 and ps[1].len > 0 and ps[1][0] == '-' and ps[1] in ["-h", "--help", "--helpsyntax"]:
       coreRunHelpPrint()
       quit(0)
-    runExecute(ps[1 .. ^1])
-
-  dispatchMulti(
-    [
-      "multi",
-      cf = coreClCfg,
-      doc = """
-
-Single-file Go runner: content-hash cache, temp module with main.go, go mod init/tidy, go build,
-then run.
-
-src: https://github.com/bdombro/gor
-
-Usage:
-
-gor -h
-gor run -h
-gor run <script.go> [args...]
-gor cacheClear
-
-""",
-      noHdr = true,
-      usage = "${doc}\nSubcommands:\n$subcmds${ifVersion}\n",
-    ],
-    [
-      run,
-      doc = """Compile (if needed) and execute a Go source file.
-
-Usage:
-
-gor run <script.go> [args...]
-
-""",
-      help = { "scriptAndArgs": "CLIGEN-NOHELP" },
-      mergeNames = @["gor", "run"],
-      noHdr = true,
-      short = { "": ' ' },
-      usage = coreUsageTmpl,
-    ],
-    [
-      cacheClear,
-      doc = """Remove the gor content-hash cache directory (under ~/.cache/gor).
-
-Usage:
-
-gor cacheClear
-
-""",
-      mergeNames = @["gor", "cacheClear"],
-      noHdr = true,
-      usage = coreUsageTmpl,
-    ],
-  )
+  cliRun(gorCliSchema, ps)

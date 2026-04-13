@@ -11,7 +11,7 @@
 # version defaults to "dev" and is used in zip names (e.g. gor-dev-aarch64-apple-darwin.zip).
 #
 # Dependencies:
-#   - nim (2.0+), nimble (gor.nimble deps, e.g. cligen)
+#   - nim (2.0+), nimble (gor.nimble deps, e.g. argsbarg)
 #   - zig (Linux cross-compiles)
 #   - zip
 
@@ -174,6 +174,7 @@ main() {
 
   cd "${GOR_ROOT}"
   nimble install -y --depsOnly
+  nimble setup
 
   # Must be global so the EXIT trap still sees it under ``set -u`` after ``main`` returns.
   build_cross_tmp="$(mktemp -d)"

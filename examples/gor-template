@@ -63,8 +63,8 @@ Code Standards:
 	  the line is a long string literal or a URL.
 
 Completions:
-	For the ``gor`` runner (cligen-style help), add after ``compinit`` in ``~/.zshrc``:
-	compdef _gnu_generic gor
+	Run ``gor completions-zsh`` to write ``~/.zsh/completions/_gor``, then put that directory on
+	zsh ``fpath`` before ``compinit`` (see gor README).
 */
 
 package main

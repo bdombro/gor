@@ -8,7 +8,12 @@ build:
 build-cross version="dev":
     ./scripts/build-cross.sh "{{version}}"
 
-# Installs the gor binary to ~/.local/bin and appends cligen-style zsh completion to ~/.zshrc when possible.
+# Installs dependencies (nim, nimscript, nimble) and runs `nimble install -d` to install dev dependencies.
+deps:
+    nimble install -y --depsOnly
+    nimble setup
+    
+# Installs the gor binary to ~/.local/bin and runs `gor completions-zsh` (writes ~/.zsh/completions/_gor).
 install:
     ./scripts/install.sh
 
