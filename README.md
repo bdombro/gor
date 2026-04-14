@@ -1,6 +1,8 @@
 # gor: Single-file Go runner
 
-Run Go files with a script-like workflow, fast reruns, and less setup friction. `gor` hashes your source, reuses a cached binary when nothing changed, and builds in an isolated temp module (`go mod init`, `go mod tidy`, `go build`) so single-file scripts can pull normal module dependencies.
+Run Go files with a script-like workflow, fast reruns, less setup friction, and **auto-downloads dependencies**. `gor` hashes your source, reuses a cached binary when nothing changed, and builds in an isolated temp module (`go mod init`, `go mod tidy`, `go build`) so single-file scripts can pull normal module dependencies.
+
+Unlike alternatives (`go run`, `gorun`), `gor` supports the same features PLUS **auto-downloads dependences**.
 
 Written in nim for max performance (1-5ms penalty).
 
@@ -9,7 +11,43 @@ Written in nim for max performance (1-5ms penalty).
 
 Just chmod +x, add a shebang (`#!/usr/bin/env gor`), and run the file (needs `gor` on `PATH`) like [gor-template](./examples/gor-template)!
 
-CLI overview:
+Your script, `foo`:
+```go
+#!/usr/bin/env gor
+
+package main
+
+import (
+	"github.com/spf13/cobra"
+)
+
+// ... rest of your code, `cobra` is auto-installed
+fmt.Println("foo")
+```
+
+```sh
+chmod +x foo
+./foo # --> prints "bar"
+```
+
+### IDE Integration
+
+For VSCode and similar to auto-choose nim language when scripts don't end with ".nim":
+
+1. Install the [Shebang Language Association extension](https://marketplace.visualstudio.com/items?itemName=davidhewitt.shebang-language-associator)
+2. Add the following to your VSCode JSON settings:
+
+```json
+  "shebang.associations": [
+    {
+      "pattern": "^#!/usr/bin/env gor$",
+      "language": "go"
+    }
+  ],
+```
+
+
+### CLI overview:
 
 ```text
 gor
