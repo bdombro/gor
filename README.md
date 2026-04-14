@@ -55,7 +55,7 @@ gor -h
 gor run -h
 gor run script.go [args...]
 gor cacheClear
-gor completions-zsh
+gor completion zsh > ~/.zsh/completions/_gor
 ```
 
 Use `gor run -h` only when there is no script path (otherwise `-h` is passed through to your program).
