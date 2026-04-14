@@ -31,7 +31,7 @@
       - procs: callee before caller when required by the compiler; otherwise alphabetical
       - prefixed with a short domain token for app features (``run`` / ``cache``); use ``core`` for
         shared CLI/runtime helpers
-    - functions must have a doc comment, and a blank empty line after the function
+    - functions must have a human-readable doc comment, and a blank empty line after the function
     - Function shape:
       - entry-point and orchestration procs read top-down as a short sequence of named steps
       - keep the happy path obvious; move mechanics into helpers with intent-revealing names
@@ -56,6 +56,9 @@
     - Use line max-width of 100 characters, unless the line is a code block or a URL
     - ``CliCommand.handler`` must be a named proc, not an inline proc literal, and must implement
       the command directly rather than just forwarding to another proc
+    - ``cliRun`` entrypoint: first argument must be an inline ``CliSchema(...)`` literal; second
+      must be an inline argv expression (e.g. ``commandLineParams()``). Do not use a ``let`` bound
+      only to pass schema or argv into ``cliRun`` alone (tests may use variables).
 ]#
 
 import std/[options, os, osproc, strutils, times]
@@ -467,37 +470,40 @@ const
   gorZshCompletionScript = coreCliSurfaceZshScript(gorCoreCliSurface)
 
 
-let gorCliSchema = CliSchema(
-  commands: @[
-    cliLeaf(
-      "cacheClear",
-      "Remove the gor content-hash cache directory.",
-      gorCacheClearHandle,
-    ),
-    cliLeaf(
-      "run",
-      "Compile and run a Go script.",
-      gorRunHandle,
-      arguments = @[
-        cliOptPositional(
-          "scriptAndArgs",
-          "The Go file to compile and run, followed by forwarded args.",
-          isRepeated = true,
-        ),
-      ],
-    ),
-  ],
-  defaultCommand: none(string),
-  description: "Single-file Go runner: content-hash cache, temp module with main.go, go mod init/tidy, go build, then run.",
-  name: "gor",
-  options: @[],
-)
-
-
+## Main entry: ``cliFallbackWhenUnknown`` so ``gor`` alone prints help and ``gor main.go`` runs
+## ``run`` without spelling ``run`` (``cacheClear`` and flags still explicit).
 when isMainModule:
   let ps = commandLineParams()
   if ps.len >= 1 and ps[0] == "run":
     if ps.len == 2 and ps[1].len > 0 and ps[1][0] == '-' and ps[1] in ["-h", "--help", "--helpsyntax"]:
       coreRunHelpPrint()
       quit(0)
-  cliRun(gorCliSchema, ps)
+  cliRun(
+    CliSchema(
+      commands: @[
+        cliLeaf(
+          "cacheClear",
+          "Remove the gor content-hash cache directory.",
+          gorCacheClearHandle,
+        ),
+        cliLeaf(
+          "run",
+          "Compile and run a Go script.",
+          gorRunHandle,
+          arguments = @[
+            cliOptPositional(
+              "scriptAndArgs",
+              "The Go file to compile and run, followed by forwarded args.",
+              isRepeated = true,
+            ),
+          ],
+        ),
+      ],
+      description: "Single-file Go runner: content-hash cache, temp module with main.go, go mod init/tidy, go build, then run.",
+      fallbackCommand: some("run"),
+      fallbackMode: cliFallbackWhenUnknown,
+      name: "gor",
+      options: @[],
+    ),
+    commandLineParams(),
+  )

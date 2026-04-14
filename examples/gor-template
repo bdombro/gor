@@ -1,4 +1,4 @@
-#!/usr/bin/env -S gor run
+#!/usr/bin/env gor
 
 /*
 Gor Template

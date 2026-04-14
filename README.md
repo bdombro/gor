@@ -7,11 +7,12 @@ Written in nim for max performance (1-5ms penalty).
 
 ## Usage
 
-chmod +x, add a shebang and run the file (needs `gor` on `PATH`) like [gor-template](./examples/gor-template)
+Just chmod +x, add a shebang (`#!/usr/bin/env gor`), and run the file (needs `gor` on `PATH`) like [gor-template](./examples/gor-template)!
 
 CLI overview:
 
 ```text
+gor
 gor -h
 gor run -h
 gor run script.go [args...]
