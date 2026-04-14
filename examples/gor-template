@@ -56,7 +56,6 @@ Code Standards:
 	  - repeated status literals and sentinels -> centralized const blocks (or typed constants when
 	    suitable)
 	- Assume a Unix-like environment and POSIX features are available.
-	- Prefer the Go standard library when it fits; add third-party modules via go.mod / go get.
 	- Use Cobra for CLI wiring and command trees.
 	  - default to no shortened flags for newly added options
 	- Run gofmt (and go vet where practical). Prefer soft line length around 100 characters unless

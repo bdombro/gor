@@ -38,9 +38,7 @@ main() {
   chmod +x "${local_bin}/gor"
   echo "install.sh: installed ${local_bin}/gor"
 
-  if [[ -x "${local_bin}/gor" ]]; then
-    "${local_bin}/gor" completions-zsh || true
-  fi
+  "${local_bin}/gor" completion zsh > ~/.zsh/completions/_gor
 }
 
 main "$@"
