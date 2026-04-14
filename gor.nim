@@ -501,7 +501,7 @@ when isMainModule:
       ],
       description: "Single-file Go runner: content-hash cache, temp module with main.go, go mod init/tidy, go build, then run.",
       fallbackCommand: some("run"),
-      fallbackMode: cliFallbackWhenUnknown,
+      fallbackMode: cliFallbackWhenMissingOrUnknown,
       name: "gor",
       options: @[],
     ),

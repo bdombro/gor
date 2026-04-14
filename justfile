@@ -33,4 +33,4 @@ release VERSION:
     fi
 
 test:
-    ./dist/gor run examples/gor-template -h
+    PATH=./dist:$PATH ./examples/gor-template
