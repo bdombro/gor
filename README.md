@@ -1,12 +1,12 @@
 # gor: Single-file Go runner
 
-Run Go files with a script-like workflow, fast reruns, less setup friction, and **auto-downloads dependencies**. `gor` hashes your source, reuses a cached binary when nothing changed, and builds in an isolated temp module (`go mod init`, `go mod tidy`, `go build`) so single-file scripts can pull normal module dependencies.
+Run Go files with a script-like workflow, fast reruns, less setup friction, and **auto-downloads dependencies**. `gor` stores compiled binaries under `~/.cache/gor/` in a **v2** layout: one subdirectory per script whose name encodes the absolute path (`v2__root__Users__…`, path segments joined with `__`, unusual characters percent-encoded and `_` as `%5F`). Inside that directory the executable is named `s_<bytes>_t_<unix>` (whole-second mtime only). When the directory name would exceed ~220 bytes, `gor` uses `v2__long__<8-hex-crc>` instead. A **warm** run reuses the cached binary when path, size, and whole-second mtime match (no temp `go.mod` work). On a **cache miss**, `gor` writes `main.go` into a temp module, runs `go mod init` / optional `go get` / `go mod tidy` / `go build`, then removes the temp tree. After a successful rebuild, older `s_*_t_*` leaves for the same script path are removed automatically. `gor cache-clear` deletes the entire cache tree (including any legacy flat files from older versions).
 
-Unlike alternatives (`go run`, `gorun`), `gor` supports the same features PLUS **auto-downloads dependences**. It's kinda like using a shebang `#!/usr/bin/env gorun`, but will automatically `go get` any dependencies.
+Unlike alternatives (`go run`, `gorun`), `gor` supports the same features PLUS **auto-downloads dependencies**. It's kinda like using a shebang `#!/usr/bin/env gorun`, but will automatically `go get` any dependencies.
 
 Written in Nim for low startup overhead (see [Benchmark](#benchmark)).
 
-Note: While nimr is convenient, it does add ~8ms startup delay compared to running a golang bin directly (see [Benchmark](#benchmark)).
+Note: A warm `gor` run still does more work than executing a pre-built Go binary directly (path/size/mtime check, then `execv` into the cached ELF); see [Benchmark](#benchmark) for rough numbers on this machine.
 
 Also checkout my similar tools:
 - [mojor](https://github.com/bdombro/mojor) for Mojo
@@ -24,7 +24,7 @@ We have a hyperfine benchmark (`./scripts/bench.sh`) to measure the cost of usin
 
 The most important number in the results is the minimum time per app.
 
-`hyperfine` warmups run before the measured samples, so this benchmark mostly reflects warm-cache behavior. That means it captures the overhead of `gor`'s hash/check/run path after the binary is already cached, not the first compile.
+`hyperfine` warmups run before the measured samples, so this benchmark mostly reflects warm-cache behavior. That means it captures the overhead of `gor`'s metadata check and exec path after the binary is already cached, not the first compile.
 
 **Results**
 
@@ -44,27 +44,32 @@ Just chmod +x, add a shebang (`#!/usr/bin/env gor`), and run the file (needs `go
 Your script, `foo`:
 ```go
 #!/usr/bin/env gor
+// gor-requires: github.com/spf13/cobra
 
 package main
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 )
 
-// ... rest of your code, `cobra` is auto-installed
-fmt.Println("foo")
+func main() {
+	fmt.Println("foo")
+	_ = cobra.Command{Use: "demo"}
+}
 ```
 
 ```sh
 chmod +x foo
-./foo # --> prints "bar"
+./foo   # prints "foo"
 ```
 
 ## More features
 
 ### Script directives (`gor-requires`, `gor-flags`)
 
-Near the top of your file (before `package`), you can add `//` line comments that `gor` reads before building. They affect the **temporary build module only**—your script file on disk is never modified. Changing directives or the main source changes the **cache key** (hash includes normalized source plus a canonical form of requires and flags), so different builds do not collide.
+Near the top of your file (before `package`), you can add `//` line comments that `gor` reads before building. They affect the **temporary build module only**—your script file on disk is never modified. The on-disk cache is keyed by the script’s **absolute path, file size, and whole-second mtime** (see the v2 layout in the intro). Saving the file updates size and/or mtime, so directive and source edits pick up on the next run. Same-second, same-size changes may reuse an existing binary until the clock advances or the size changes. The same source at two different paths produces two cache group directories; moving or copying the file counts as a new path.
 
 **`gor-requires`** — run `go get <spec>` for each comma-separated module after `go mod init` and before `go mod tidy`. Use full module paths (must contain `.` or `/`). You may use several `gor-requires:` lines; entries append. Pin a version with `@`:
 
@@ -153,20 +158,21 @@ just install
 # or: ./scripts/install.sh
 ```
 
-That copies `dist/gor` to `~/.local/bin/gor`, then runs the built-in `completion zsh` command, which writes `~/.zsh/completions/_gor` (creating `~/.zsh/completions/` if needed, or replacing `_gor` if it already exists). The install script does **not** edit `~/.zshrc`; you must put that directory on zsh `fpath` **before** `compinit` (see below).
+That copies `dist/gor` to `~/.local/bin/gor`, then runs `gor completion zsh` with stdout redirected to `~/.zsh/completions/_gor` (creating that directory first if needed). The install script does **not** edit `~/.zshrc`; you must put that directory on zsh `fpath` **before** `compinit` (see below).
 
 
 ## Completions
 
 ### Zsh (file-based `_gor`)
 
-Generate or refresh the completion script:
+Generate the completion script on **stdout** (from argsbarg), then save it yourself:
 
 ```sh
-gor completion zsh
+mkdir -p ~/.zsh/completions
+gor completion zsh > ~/.zsh/completions/_gor
 ```
 
-This installs `~/.zsh/completions/_gor`. If the directory did not exist, `gor` prints a warning when it creates it.
+The `just install` / `./scripts/install.sh` path does the same redirect after building `dist/gor`.
 
 Put **`~/.zsh/completions` on `fpath` before `compinit`**. For example in `~/.zshrc`:
 

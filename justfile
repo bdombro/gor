@@ -5,7 +5,7 @@ _:
 bench:
     ./scripts/bench.sh
 
-# Builds the gor binary for the current platform → gor/dist/gor (version in filename; default "dev").
+# Builds the gor binary for the current platform → ./dist/gor (version in filename; default "dev").
 build:
     ./scripts/build.sh
 

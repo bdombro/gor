@@ -1,6 +1,6 @@
 version = "0.1.0"
 author = "Brian Dombroski"
-description = "Single-file Go runner with content-hash cache and temp go.mod build"
+description = "Single-file Go runner with v2 path/size/mtime cache (group dir + leaf) and temp go.mod build"
 license = "MIT"
 
 bin = @["gor"]

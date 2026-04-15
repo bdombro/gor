@@ -6,13 +6,13 @@
 #
 # Artifacts (checked in under scripts/bench-assets/):
 #   - gor-hello        — `#!/usr/bin/env gor` script
-#   - go-run-hello     — wrapper script that runs `go run` on the source file below
+#   - gorun-hello      — wrapper that runs `gorun` on the same tiny program
 #   - go-hello.bin     — same program compiled once with `go build` (no script runner)
 #
 # What the numbers mean:
 #   Hyperfine reports mean ± σ over multiple runs. `--warmup` runs happen first and are
 #   excluded from those statistics, which mostly measures “warm” behavior (e.g. gor’s
-#   content-hash cache hit, `go run` not recompiling when nothing changed). For cold-start /
+#   metadata cache hit after path/size/mtime match, `go run` not recompiling when nothing changed). For cold-start /
 #   first-compile behavior, run the commands manually or clear caches and use hyperfine
 #   without warmup / with `--runs 1` as a separate experiment.
 #

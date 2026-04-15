@@ -38,9 +38,10 @@ main() {
   chmod +x "${local_bin}/gor"
   echo "install.sh: installed ${local_bin}/gor"
 
+  mkdir -p "${HOME}/.zsh/completions"
   set -x
-  "${local_bin}/gor" completion zsh > ~/.zsh/completions/_gor
-  "${local_bin}/gor" cache-clear
+  "${local_bin}/gor" completion zsh > "${HOME}/.zsh/completions/_gor"
+  "${dist_bin}" cache-clear
   set +x
 }
 
