@@ -1,8 +1,8 @@
 #[
   gor
 
-  Single-file Go runner: content-hash cache, temp module with ``main.go``, ``go mod init``,
-  ``go mod tidy``, ``go build``, then execute.
+  Single-file Go runner: v2 metadata cache (``v2__…`` group dir per path, ``s_*_t_*`` leaf), temp module
+  with ``main.go``, ``go mod init``, ``go mod tidy``, ``go build``, then execute.
 
   Usage:
     gor -h
@@ -61,46 +61,21 @@
       only to pass schema or argv into ``cliRun`` alone (tests may use variables).
 ]#
 
-import std/[algorithm, options, os, osproc, strutils, times]
+import std/[options, os, osproc, posix, strutils, times]
 import argsbarg
 
-{.push warning[Deprecated]: off.}
-import std/sha1
-{.pop.}
-
-## Oldest last-use ``mtime`` still kept after a compile-triggered sweep of the hash cache directory.
-const cacheUnusedMaxAgeDays = 30
+## Max bytes for a v2 group directory name before falling back to ``v2__long__<crc32hex>``.
+const cacheScriptGroupDirMaxBytes = 220
 
 type
-  ## Zsh completion behavior after a top-level subcommand word (word 2).
-  CoreCliSurfaceZshTail = enum
-    coreCliSurfaceZshTailNone
-    coreCliSurfaceZshTailFiles
-    coreCliSurfaceZshTailNestedWords
-
-type
-  ## One top-level subcommand plus zsh tail behavior and an optional usage line suffix.
-  CoreCliSurfaceTopCmd = object
-    ## Subcommand name offered at ``CURRENT == 2``.
-    name: string
-    ## How zsh completes further tokens under this subcommand.
-    zshTail: CoreCliSurfaceZshTail
-    ## Words offered at ``CURRENT == 3`` when ``zshTail`` is ``coreCliSurfaceZshTailNestedWords``.
-    nestedWords: seq[string]
-    ## Text after ``prog & " "`` for one usage line; empty to omit from usage output.
-    usageLine: string
-
-type
-  ## Declarative CLI surface for zsh completion text and indented usage lines.
-  CoreCliSurfaceSpec = object
-    ## Program name for ``#compdef`` and usage lines.
-    prog: string
-    ## Zsh completion function name including leading underscore.
-    zshFunc: string
-    ## Usage line suffixes (after ``prog & " "``) printed before per-command lines.
-    usagePreamble: seq[string]
-    ## Top-level subcommands (TAB at word 2).
-    topCommands: seq[CoreCliSurfaceTopCmd]
+  ## Filesystem identity for cache lookup, naming, and same-path sibling purging (absolute path, size, mtime unix seconds).
+  RunScriptCacheIdentity = object
+    ## Canonical script path from ``expandFilename`` (``realpath``-resolved).
+    absPath: string
+    ## Whole-second mtime from ``getFileInfo`` (``toUnix``); sub-second differences are ignored for the cache key.
+    mtimeUnix: int64
+    ## File size in bytes from ``getFileInfo``.
+    size: int64
 
 type
   ## Parsed ``gor-requires`` / ``gor-flags`` directives plus the ``main.go`` body (directives stripped).
@@ -113,47 +88,6 @@ type
     requires: seq[string]
 
 
-## Indented usage lines from ``spec.usagePreamble`` and non-empty ``usageLine`` fields.
-proc coreCliSurfaceUsageIndented(spec: CoreCliSurfaceSpec): string =
-  var lines: seq[string]
-  for p in spec.usagePreamble:
-    lines.add("  " & spec.prog & " " & p)
-  for c in spec.topCommands:
-    if c.usageLine.len > 0:
-      lines.add("  " & spec.prog & " " & c.usageLine)
-  lines.join("\n")
-
-
-## Builds the zsh completion script body (``#compdef``, function, ``case`` arms, ``_files`` tail).
-proc coreCliSurfaceZshScript(spec: CoreCliSurfaceSpec): string =
-  var names: seq[string]
-  for c in spec.topCommands:
-    names.add(c.name)
-  let compaddLine = names.join(" ")
-  var arms = ""
-  for c in spec.topCommands:
-    arms.add("  ")
-    arms.add(c.name)
-    arms.add(")\n")
-    case c.zshTail
-    of coreCliSurfaceZshTailNone:
-      arms.add("    return 0\n    ;;\n")
-    of coreCliSurfaceZshTailFiles:
-      arms.add("    _files && return 0\n    ;;\n")
-    of coreCliSurfaceZshTailNestedWords:
-      arms.add("    if (( CURRENT == 3 )); then\n      compadd ")
-      arms.add(c.nestedWords.join(" "))
-      arms.add(" && return 0\n    fi\n    ;;\n")
-  result = "#compdef " & spec.prog & "\n\n" & spec.zshFunc & "() {\n"
-  result.add("  if (( CURRENT == 2 )); then\n    compadd ")
-  result.add(compaddLine)
-  result.add("\n    return\n  fi\n  case ${words[2]} in\n")
-  result.add(arms)
-  result.add("  esac\n  _files\n}\n\n")
-  result.add(spec.zshFunc)
-  result.add(" \"$@\"\n")
-
-
 ## Returns the gor cache directory under ``$HOME/.cache/gor``.
 proc cacheDirGorGet(): string =
   let home = getEnv("HOME")
@@ -163,50 +97,162 @@ proc cacheDirGorGet(): string =
   home / ".cache" / "gor"
 
 
-## Bumps ``path`` ``mtime`` to now so sweeps use last-run time, not compile time.
-proc cacheBinaryLastUseTouch(path: string) =
-  try:
-    setLastModificationTime(path, getTime())
-  except CatchableError:
-    discard
+## IEEE CRC-32 of ``data`` (ZIP polynomial), for ``v2__long__`` fallback directory names.
+proc cacheScriptPathCrc32U32(data: string): uint32 =
+  var c = not 0'u32
+  for idx in 0 ..< data.len:
+    c = c xor uint32(data[idx].uint8)
+    for i in 0 ..< 8:
+      if (c and 1'u32) != 0:
+        c = (c shr 1) xor 0xedb88320'u32
+      else:
+        c = c shr 1
+  result = c xor not 0'u32
 
 
-## Returns the absolute path to the cached executable for ``hashHex``.
-proc cacheBinaryPathGet(hashHex: string): string =
-  let dir = cacheDirGorGet()
-  createDir(dir)
-  when defined(windows):
-    dir / hashHex & ".exe"
-  else:
-    dir / hashHex
+## Eight lowercase hex digits of ``cacheScriptPathCrc32U32(absPath)``.
+proc cacheScriptPathCrc32Hex8Lower(absPath: string): string =
+  let x = cacheScriptPathCrc32U32(absPath)
+  const hx = "0123456789abcdef"
+  for i in 0 ..< 8:
+    let sh = uint32((7 - i) * 4)
+    result.add hx[int(x shr sh) and 0xF]
 
 
-## Drops cached binaries under ``dir`` whose ``mtime`` is older than ``cacheUnusedMaxAgeDays``.
-proc cacheStaleBinaryRemove(dir: string) =
-  if not dirExists(dir):
+## Percent-encodes one path segment for v2 group dir names (safe set ``A-Za-z0-9-.`` only).
+proc cacheScriptSegmentEncode(seg: string): string =
+  const hex = "0123456789ABCDEF"
+  for j in 0 ..< seg.len:
+    let c = seg[j]
+    if c in {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '-', '.'}:
+      result.add(c)
+    else:
+      let b = ord(c) and 0xff
+      result.add('%')
+      result.add(hex[b shr 4])
+      result.add(hex[b and 0x0F])
+
+
+## Opens (creating if needed) a per-binary advisory lock file and acquires an exclusive write lock
+## via ``fcntl F_SETLKW``. Blocks until the lock is available. Returns the open fd (``O_CLOEXEC``).
+## On failure prints to stderr and quits with 1.
+proc cacheScriptBuildLockAcquire(binaryPath: string): cint =
+  let lockPath = binaryPath & ".lock"
+  let fd = posix.open(lockPath.cstring, O_CREAT or O_WRONLY or O_CLOEXEC, 0o600.Mode)
+  if fd < 0'i32:
+    stderr.writeLine "[gor] could not open lock file: ", lockPath, ": ", osErrorMsg(osLastError())
+    quit(1)
+  var lk: Tflock
+  lk.l_type = F_WRLCK.cshort
+  lk.l_whence = SEEK_SET.cshort
+  lk.l_start = 0.Off
+  lk.l_len = 0.Off
+  if fcntl(fd, F_SETLKW, addr lk) < 0'i32:
+    discard posix.close(fd)
+    stderr.writeLine "[gor] could not acquire lock: ", lockPath, ": ", osErrorMsg(osLastError())
+    quit(1)
+  fd
+
+
+## V2 cache group directory basename: ``v2__`` + path segments joined with ``__``, or ``v2__long__<crc>`` when too long.
+proc cacheScriptGroupDirNameGet(absPath: string): string =
+  var parts: seq[string] = @[]
+  var cur = ""
+  for i in 0 ..< absPath.len:
+    let isSep = absPath[i] == DirSep
+    if isSep:
+      if cur.len > 0:
+        parts.add(cacheScriptSegmentEncode(cur))
+        cur = ""
+      elif parts.len == 0:
+        parts.add("root")
+    else:
+      cur.add(absPath[i])
+  if cur.len > 0:
+    parts.add(cacheScriptSegmentEncode(cur))
+  if parts.len == 0:
+    stderr.writeLine "[gor] empty path for cache group"
+    quit(1)
+  result = "v2"
+  for p in parts:
+    result.add("__")
+    result.add(p)
+  if result.len > cacheScriptGroupDirMaxBytes:
+    result = "v2__long__" & cacheScriptPathCrc32Hex8Lower(absPath)
+
+
+## Leaf basename ``s_<size>_t_<mtimeUnix>`` for the v2 cache layout.
+proc cacheScriptLeafBaseNameGet(id: RunScriptCacheIdentity): string =
+  "s_" & $id.size & "_t_" & $id.mtimeUnix
+
+
+## True when ``fname`` is a v2 leaf basename (``s_<digits>_t_<digits>``).
+proc cacheScriptLeafNameIs(fname: string): bool =
+  let base = fname
+  if not base.startsWith("s_"):
+    return false
+  var i = 2
+  if i >= base.len or base[i] notin {'0' .. '9'}:
+    return false
+  while i < base.len and base[i] in {'0' .. '9'}:
+    inc i
+  if i + 2 >= base.len or base[i] != '_' or base[i + 1] != 't' or base[i + 2] != '_':
+    return false
+  inc i, 3
+  if i >= base.len or base[i] notin {'0' .. '9'}:
+    return false
+  while i < base.len and base[i] in {'0' .. '9'}:
+    inc i
+  result = i == base.len
+
+
+## Returns the absolute path to the cached executable for ``id`` (does not create directories).
+proc cacheBinaryPathFromIdentity(id: RunScriptCacheIdentity): string =
+  let root = cacheDirGorGet()
+  let gname = cacheScriptGroupDirNameGet(id.absPath)
+  let gdir = root / gname
+  let leaf = cacheScriptLeafBaseNameGet(id)
+  result = gdir / leaf
+
+
+## Short suffix for ``go mod init script-…`` from script stem and last six decimal digits of ``mtimeUnix``.
+proc cacheGoModSuffixFromIdentity(id: RunScriptCacheIdentity): string =
+  let (_, stemNoExt, _) = splitFile(extractFilename(id.absPath))
+  var stem6 = ""
+  for ch in stemNoExt:
+    if ch in {'a' .. 'z', 'A' .. 'Z', '0' .. '9'}:
+      stem6.add(ch)
+      if stem6.len >= 6:
+        break
+  if stem6.len == 0:
+    stem6 = "gor"
+  let ux = $id.mtimeUnix
+  let tail =
+    if ux.len >= 6:
+      ux[^6 .. ^1]
+    else:
+      align(ux, 6, '0')
+  stem6 & "_" & tail
+
+
+## Removes other v2 leaf binaries in this script’s cache group directory (same path, other size/mtime).
+proc cacheSiblingsStaleRemove(id: RunScriptCacheIdentity) =
+  let gdir = cacheDirGorGet() / cacheScriptGroupDirNameGet(id.absPath)
+  if not dirExists(gdir):
     return
-  let cutoff = getTime() - initTimeInterval(days = cacheUnusedMaxAgeDays)
-  for kind, path in walkDir(dir):
+  let curLeaf = cacheScriptLeafBaseNameGet(id)
+  for kind, path in walkDir(gdir):
     if kind != pcFile:
       continue
+    let fname = extractFilename(path)
+    if not cacheScriptLeafNameIs(fname):
+      continue
+    if fname == curLeaf:
+      continue
     try:
-      if getLastModificationTime(path) < cutoff:
-        removeFile(path)
+      removeFile(path)
     except CatchableError:
       discard
-
-
-## Deletes the gor cache directory when it exists.
-proc cacheClearRun() =
-  let dir = cacheDirGorGet()
-  if not dirExists(dir):
-    return
-  try:
-    removeDir(dir, checkDir = false)
-  except CatchableError as e:
-    stderr.writeLine "[gor] could not clear cache: ", e.msg
-    quit(1)
-  stderr.writeLine "[gor] cleared ", dir
 
 
 ## Writes ``body`` to stdout with a blank line before and after (for ``-h`` / help output).
@@ -221,88 +267,14 @@ proc coreCliHelpStdoutWrite(body: string; docAttrsPrefix = ""; docAttrsSuffix = 
   stdout.write '\n'
 
 
-## True when ANSI colors should be suppressed (same rule as former cligen config loading).
-proc coreCliPlainGet(): bool =
-  existsEnv("NO_COLOR") and getEnv("NO_COLOR") notin ["0", "no", "off", "false"]
-
-
-## If ``absPath`` starts with ``home`` as a directory prefix, returns tilde form (``~`` + suffix).
-proc corePathDisplayTilde(home, absPath: string): string =
-  if home.len == 0 or absPath.len < home.len:
-    return absPath
-  if not absPath.startsWith(home):
-    return absPath
-  if absPath.len > home.len and absPath[home.len] != DirSep:
-    return absPath
-  if absPath.len == home.len:
-    return "~"
-  "~" & absPath[home.len .. ^1]
-
-
-## Builds an SGR ``on`` sequence from space-separated attribute words, or empty when ``plain``.
-proc coreTextAttrOn(words: openArray[string]; plain: bool): string =
-  if plain:
-    return ""
-  const esc = "\x1b["
-  var parts: seq[string]
-  for w in words:
-    case w
-    of "bold": parts.add "1"
-    of "faint": parts.add "2"
-    of "cyan": parts.add "36"
-    of "green": parts.add "32"
-    of "yellow": parts.add "33"
-    else: discard
-  if parts.len == 0:
-    return ""
-  esc & parts.join(";") & "m"
-
-
-## Resets SGR when not ``plain``.
-proc coreTextAttrOff(plain: bool): string =
-  if plain:
-    ""
-  else:
-    "\x1b[m"
-
-
-## Writes ``contents`` to ``HOME/.zsh/completions/zshFileName``. Warns when the directory is created;
-## prints an ``fpath``/``compinit`` hint only in that case.
-proc coreZshCompletionFileWrite(appBin, zshFileName, contents: string) =
-  let home = getEnv("HOME")
-  if home.len == 0:
-    stderr.writeLine appBin, ": HOME is not set"
-    quit(1)
-  let dir = home / ".zsh" / "completions"
-  let dirExisted = dir.dirExists
-  if not dirExisted:
-    stderr.writeLine appBin, ": warning: ", corePathDisplayTilde(home, dir), " did not exist; creating it"
-    createDir(dir)
-  let path = dir / zshFileName
-  writeFile(path, contents)
-  stdout.writeLine appBin, ": wrote ", corePathDisplayTilde(home, path)
-  if not dirExisted:
-    stdout.writeLine appBin, ": add ", corePathDisplayTilde(home, dir),
-      " to fpath before compinit, then restart zsh or run: compinit"
-
-
-## Drops a leading shebang so changing only the runner line does not bust the cache.
-proc coreNormalizeForHash(content: string): string =
+## Drops a leading shebang line before directive parsing and ``main.go`` emission.
+proc coreShebangStrip(content: string): string =
   if content.startsWith("#!"):
     let nl = content.find('\n')
     if nl >= 0:
       return content[nl + 1 .. ^1]
     return ""
   content
-
-
-## Builds the hash input string: normalized source plus sorted ``requires`` and ``buildFlags`` sections.
-proc runScriptHashInputGet(normalizedSource: string; requires, buildFlags: seq[string]): string =
-  var req = requires
-  var flg = buildFlags
-  sort(req)
-  sort(flg)
-  normalizedSource & "\x1f" & req.join("\n") & "\x1f" & flg.join("\n")
 
 
 ## True when ``line`` is a Go ``package`` declaration (first field ``package``).
@@ -314,7 +286,7 @@ proc runScriptLinePackageIs(line: string): bool =
 ## Parses ``gor-requires`` / ``gor-flags`` from leading ``//`` lines before ``package``; strips those lines
 ## from the source written to ``main.go``. Quits on malformed or unknown directives.
 proc runScriptMetaParse(raw: string): RunScriptMeta =
-  let body = coreNormalizeForHash(raw)
+  let body = coreShebangStrip(raw)
   if body.len == 0:
     stderr.writeLine "[gor] empty script after shebang"
     quit(1)
@@ -411,19 +383,14 @@ gor run <script.go> [args...]
 
 ## ``go mod init``, optional ``go get`` for ``requires``, ``go mod tidy``, then ``go build`` with
 ## ``buildFlags``; writes ``binaryPath``.
-proc runGoCompile(workDir: string; binaryPath: string; hashHex: string;
+proc runGoCompile(workDir: string; binaryPath: string; modSuffix: string;
     requires, buildFlags: seq[string]): int =
   let goExe = findExe("go")
   if goExe.len == 0:
     stderr.writeLine "[gor] go is not on PATH"
     stderr.writeLine "[gor] install Go: https://go.dev/dl/"
     quit(1)
-  let prefix =
-    if hashHex.len >= 8:
-      hashHex[0 ..< 8]
-    else:
-      hashHex
-  let modName = "script-" & prefix
+  let modName = "script-" & modSuffix
   var code = coreProcessExitCodeWait(goExe, @["mod", "init", modName], workDir)
   if code != 0:
     return code
@@ -438,12 +405,31 @@ proc runGoCompile(workDir: string; binaryPath: string; hashHex: string;
   coreProcessExitCodeWait(goExe, buildArgs, workDir)
 
 
-## Executes ``binary`` and forwards ``args``, then quits with the child exit code.
+## Replaces the current process with ``binary``, forwarding ``args`` as argv (``binary`` is argv0).
+## Does not return on success; on failure prints to stderr and quits with 1.
 proc runBinaryExec(binary: string; args: openArray[string]) =
-  let p = startProcess(binary, args = args, options = {poParentStreams})
-  let code = waitForExit(p)
-  close(p)
-  quit(code)
+  var argv = allocCStringArray(@[binary] & @args)
+  defer: deallocCStringArray(argv)
+  if posix.execv(binary.cstring, argv) < 0'i32:
+    stderr.writeLine "[gor] exec failed: ", binary, ": ", osErrorMsg(osLastError())
+    quit(1)
+
+
+## Builds ``RunScriptCacheIdentity`` from a single ``getFileInfo`` call (size, ``mtimeUnix``, kind check).
+## Quits if ``absPath`` is not a regular file or cannot be stat'd.
+proc runScriptCacheIdentityFrom(absPath: string): RunScriptCacheIdentity =
+  var info: FileInfo
+  try:
+    info = getFileInfo(absPath, followSymlink = true)
+  except CatchableError as e:
+    stderr.writeLine "[gor] could not stat: ", absPath, ": ", e.msg
+    quit(1)
+  if info.kind != pcFile:
+    stderr.writeLine "[gor] not a file: ", absPath
+    quit(1)
+  result.absPath = absPath
+  result.mtimeUnix = info.lastWriteTime.toUnix
+  result.size = int64(info.size)
 
 
 ## Reads ``scriptAndArgs``, parses directives, compiles on cache miss, then runs the cached binary.
@@ -457,34 +443,55 @@ proc runScriptCompileAndExec(scriptAndArgs: seq[string]) =
       scriptAndArgs[1 .. ^1]
     else:
       @[]
-  let scriptPath = expandFilename(absolutePath(script))
-  if not fileExists(scriptPath):
-    stderr.writeLine "[gor] not a file: ", scriptPath
-    quit(1)
+  let scriptPath =
+    try: expandFilename(script)
+    except CatchableError:
+      stderr.writeLine "[gor] not a file: ", script
+      quit(1)
+  let id = runScriptCacheIdentityFrom(scriptPath)
+  let binaryPath = cacheBinaryPathFromIdentity(id)
+  if fileExists(binaryPath):
+    runBinaryExec(binaryPath, args)
+  createDir(binaryPath.parentDir())
+  let lockFd = cacheScriptBuildLockAcquire(binaryPath)
+  if fileExists(binaryPath):
+    discard posix.close(lockFd)
+    runBinaryExec(binaryPath, args)
   let raw = readFile(scriptPath)
   let meta = runScriptMetaParse(raw)
-  let hashHex = $secureHash(runScriptHashInputGet(
-    meta.normalizedSource, meta.requires, meta.buildFlags))
-  let binaryPath = cacheBinaryPathGet(hashHex)
-  if fileExists(binaryPath):
-    cacheBinaryLastUseTouch(binaryPath)
-    runBinaryExec(binaryPath, args)
-  let tmpRoot = getTempDir() / ("gor-build-" & hashHex[0 ..< 16])
+  let modSuffix = cacheGoModSuffixFromIdentity(id)
+  let tmpRoot = getTempDir() / ("gor-build-" & modSuffix)
   createDir(tmpRoot)
   let mainGo = tmpRoot / "main.go"
   writeFile(mainGo, meta.normalizedSource)
-  let code = runGoCompile(tmpRoot, binaryPath, hashHex, meta.requires, meta.buildFlags)
+  let tmpBinary = binaryPath & "." & $getCurrentProcessId()
+  let code = runGoCompile(tmpRoot, tmpBinary, modSuffix, meta.requires, meta.buildFlags)
   try:
     removeDir(tmpRoot)
   except CatchableError:
     discard
   if code != 0:
+    try:
+      removeFile(tmpBinary)
+    except CatchableError:
+      discard
+    discard posix.close(lockFd)
     quit(code)
-  cacheStaleBinaryRemove(cacheDirGorGet())
+  try:
+    moveFile(tmpBinary, binaryPath)
+  except CatchableError as e:
+    try:
+      removeFile(tmpBinary)
+    except CatchableError:
+      discard
+    discard posix.close(lockFd)
+    stderr.writeLine "[gor] could not rename binary: ", e.msg
+    quit(1)
+  cacheSiblingsStaleRemove(id)
   runBinaryExec(binaryPath, args)
 
 
-## Removes the gor content-hash cache directory.
+## Removes the gor script cache directory.
 proc gorCacheClearHandle(ctx: CliContext) =
   discard ctx
   let dir = cacheDirGorGet()
@@ -503,35 +510,7 @@ proc gorRunHandle(ctx: CliContext) =
   runScriptCompileAndExec(ctx.args)
 
 
-const
-  ## Declarative CLI surface for zsh completion and usage lines.
-  gorCoreCliSurface = CoreCliSurfaceSpec(
-    prog: "gor",
-    zshFunc: "_gor",
-    usagePreamble: @["-h", "run -h"],
-    topCommands: @[
-      CoreCliSurfaceTopCmd(
-        name: "run",
-        zshTail: coreCliSurfaceZshTailFiles,
-        nestedWords: @[],
-        usageLine: "run <script.go> [args...]"),
-      CoreCliSurfaceTopCmd(
-        name: "cache-clear",
-        zshTail: coreCliSurfaceZshTailNone,
-        nestedWords: @[],
-        usageLine: "cache-clear"),
-      CoreCliSurfaceTopCmd(
-        name: "completion",
-        zshTail: coreCliSurfaceZshTailNestedWords,
-        nestedWords: @["zsh"],
-        usageLine: "completion zsh"),
-    ],
-  )
-  ## Zsh completion script for ``gor`` (from ``gorCoreCliSurface``).
-  gorZshCompletionScript = coreCliSurfaceZshScript(gorCoreCliSurface)
-
-
-## Main entry: ``cliFallbackWhenUnknown`` so ``gor`` alone prints help and ``gor main.go`` runs
+## Main entry: ``cliFallbackWhenMissingOrUnknown`` so ``gor`` alone prints help and ``gor main.go`` runs
 ## ``run`` without spelling ``run`` (``cache-clear`` and flags still explicit).
 when isMainModule:
   let ps = commandLineParams()
@@ -544,7 +523,7 @@ when isMainModule:
       commands: @[
         cliLeaf(
           "cache-clear",
-          "Remove the gor content-hash cache directory.",
+          "Remove the gor script cache directory.",
           gorCacheClearHandle,
         ),
         cliLeaf(
@@ -560,7 +539,7 @@ when isMainModule:
           ],
         ),
       ],
-      description: "Single-file Go runner: content-hash cache, temp module with main.go, go mod init/tidy, go build, then run.",
+      description: "Single-file Go runner: v2 path/size/mtime cache (group dir + leaf binary); on miss, temp module with main.go, go mod init/tidy, go build; warm path execs cached binary.",
       fallbackCommand: some("run"),
       fallbackMode: cliFallbackWhenMissingOrUnknown,
       name: "gor",
