@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Build gor, install the binary to ~/.local/bin, and optionally write zsh completion to
-# ~/.zsh/completions/_gor via `gor completions-zsh`.
+# Build gor, install the binary to ~/.local/bin, and write zsh completion to
+# ~/.zsh/completions/_gor via `gor completion zsh`.
 # Run from anywhere; paths are resolved from this script.
 #
 # Usage:
@@ -38,8 +38,10 @@ main() {
   chmod +x "${local_bin}/gor"
   echo "install.sh: installed ${local_bin}/gor"
 
+  set -x
   "${local_bin}/gor" completion zsh > ~/.zsh/completions/_gor
   "${local_bin}/gor" cache-clear
+  set +x
 }
 
 main "$@"

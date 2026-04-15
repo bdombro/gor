@@ -2,6 +2,7 @@
 
 # Publish a GitHub release using pre-built zip artifacts from gor/dist/.
 # Run ``./scripts/build-cross.sh <version>`` first (same version string).
+# Tags HEAD and pushes to ``origin``, then runs ``gh release create``.
 #
 # Run from anywhere; paths are resolved from this script.
 #
@@ -55,6 +56,7 @@ main() {
   [[ ${#ASSETS[@]} -ge 1 ]] || die \
     "no zips matching ${dist_dir}/${RELEASE_ASSET_PREFIX}-${version}-*.zip; run scripts/build-cross.sh ${version} first."
 
+  git_annotated_release_tag_add "${version}"
   gh release create "${version}" "${ASSETS[@]}" --generate-notes
 }
 
@@ -62,7 +64,8 @@ print_help() {
   cat <<'EOF'
 Usage: release.sh <version | patch | minor | major>
 
-Creates a GitHub release from pre-built zips in gor/dist/ (see scripts/build-cross.sh).
+Tags HEAD, pushes the tag to origin, then creates a GitHub release from pre-built zips in
+gor/dist/ (see scripts/build-cross.sh).
 
 Dependencies:
   git     repository root and remote URL for gh
@@ -80,6 +83,14 @@ repo_root() {
 die() {
   echo "release.sh: $1" >&2
   exit 1
+}
+
+## Annotated tag ``tag`` at HEAD (replaces the local tag if it already exists).
+git_annotated_release_tag_add() {
+  local tag="$1"
+  git tag -af "${tag}" -m "gor ${tag}"
+  git push --force origin "${tag}"
+  echo "release.sh: tagged ${tag}" >&2
 }
 
 configure_github_repo() {
