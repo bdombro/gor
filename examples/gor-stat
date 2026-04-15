@@ -1,7 +1,7 @@
 #!/usr/bin/env gor
 
 /*
-Gor Template
+ Gor Stat
 
 Seed for new gor-powered CLI tools based on the shared patterns in
 image-compress-resize, pdf-compress, and video-compress-resize.
@@ -10,9 +10,9 @@ The default implementation copies each input to a sibling `-out` path so the
 full batch/reporting flow works before you replace the app-specific hooks.
 
 Usage:
-	gor-template -h
-	gor-template stat [--ci] [paths...]
-	gor-template process [files...]
+	gor-stat -h
+	gor-stat stat [--ci] [paths...]
+	gor-stat process [files...]
 
 Code Standards:
 	- Commands that shell out to non-bundled binaries should check PATH, print install hints, and
@@ -62,7 +62,7 @@ Code Standards:
 	  the line is a long string literal or a URL.
 
 Completions:
-	Run ``gor completions-zsh`` to write ``~/.zsh/completions/_gor``, then put that directory on
+	Run the built-in ``completion zsh`` command to write ``~/.zsh/completions/_gor``, then put that directory on
 	zsh ``fpath`` before ``compinit`` (see gor README).
 */
 
@@ -89,8 +89,8 @@ const (
 	// appStatusProcessed is stored in appResult.status after a successful copy (or dry-run stand-in).
 	appStatusProcessed = "processed"
 	appStatusSkipped   = "skipped"
-	appTitle           = "Gor Template"
-	appUse             = "gor-template"
+	appTitle           = "Gor Stat"
+	appUse             = "gor-stat"
 	statStatusFailed  = "failed"
 	statStatusOK      = "ok"
 	statStatusSkipped = "skipped"

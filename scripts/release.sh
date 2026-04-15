@@ -65,7 +65,7 @@ print_help() {
 Usage: release.sh <version | patch | minor | major>
 
 Tags HEAD, pushes the tag to origin, then creates a GitHub release from pre-built zips in
-gor/dist/ (see scripts/build-cross.sh).
+dist/ (see scripts/build-cross.sh).
 
 Dependencies:
   git     repository root and remote URL for gh

@@ -1,6 +1,11 @@
 _:
     just --list
 
+# Hyperfine: benchmarks for gor (see scripts/bench.sh).
+bench:
+    ./scripts/bench.sh
+
+# Builds the gor binary for the current platform → gor/dist/gor (version in filename; default "dev").
 build:
     ./scripts/build.sh
 
@@ -13,7 +18,7 @@ deps:
     nimble install -y --depsOnly
     nimble setup
     
-# Installs the gor binary to ~/.local/bin and runs `gor completions-zsh` (writes ~/.zsh/completions/_gor).
+# Installs the gor binary to ~/.local/bin and runs the built-in `completion zsh` command (writes ~/.zsh/completions/_gor).
 install:
     ./scripts/install.sh
 
@@ -33,4 +38,4 @@ release VERSION:
     fi
 
 test:
-    PATH=./dist:$PATH ./examples/gor-template
+    PATH=./dist:$PATH ./examples/gor-stat

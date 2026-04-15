@@ -9,7 +9,7 @@
     gor run -h
     gor run script.go [args...]
     gor cache-clear
-    gor completions-zsh
+    gor completion zsh
 
   ``gor run -h`` applies only when no script path is given (otherwise ``-h`` is forwarded to the
   compiled program).
@@ -61,7 +61,7 @@
       only to pass schema or argv into ``cliRun`` alone (tests may use variables).
 ]#
 
-import std/[options, os, osproc, strutils, times]
+import std/[algorithm, options, os, osproc, strutils, times]
 import argsbarg
 
 {.push warning[Deprecated]: off.}
@@ -101,6 +101,16 @@ type
     usagePreamble: seq[string]
     ## Top-level subcommands (TAB at word 2).
     topCommands: seq[CoreCliSurfaceTopCmd]
+
+type
+  ## Parsed ``gor-requires`` / ``gor-flags`` directives plus the ``main.go`` body (directives stripped).
+  RunScriptMeta = object
+    ## Extra tokens passed to ``go build`` only (not to the compiled program).
+    buildFlags: seq[string]
+    ## Source written to the temp ``main.go`` (shebang dropped, ``gor-*`` directive lines removed).
+    normalizedSource: string
+    ## Module specs for ``go get`` after ``go mod init`` (``module`` or ``module@version``).
+    requires: seq[string]
 
 
 ## Indented usage lines from ``spec.usagePreamble`` and non-empty ``usageLine`` fields.
@@ -286,6 +296,99 @@ proc coreNormalizeForHash(content: string): string =
   content
 
 
+## Builds the hash input string: normalized source plus sorted ``requires`` and ``buildFlags`` sections.
+proc runScriptHashInputGet(normalizedSource: string; requires, buildFlags: seq[string]): string =
+  var req = requires
+  var flg = buildFlags
+  sort(req)
+  sort(flg)
+  normalizedSource & "\x1f" & req.join("\n") & "\x1f" & flg.join("\n")
+
+
+## True when ``line`` is a Go ``package`` declaration (first field ``package``).
+proc runScriptLinePackageIs(line: string): bool =
+  let parts = line.strip().splitWhitespace()
+  parts.len >= 1 and parts[0] == "package"
+
+
+## Parses ``gor-requires`` / ``gor-flags`` from leading ``//`` lines before ``package``; strips those lines
+## from the source written to ``main.go``. Quits on malformed or unknown directives.
+proc runScriptMetaParse(raw: string): RunScriptMeta =
+  let body = coreNormalizeForHash(raw)
+  if body.len == 0:
+    stderr.writeLine "[gor] empty script after shebang"
+    quit(1)
+  let lines = body.splitLines()
+  var pkgIdx = -1
+  for i, ln in lines:
+    if runScriptLinePackageIs(ln):
+      pkgIdx = i
+      break
+  if pkgIdx < 0:
+    stderr.writeLine "[gor] missing package declaration"
+    quit(1)
+  var outBefore: seq[string]
+  var flagsLines = 0
+  for j in 0 ..< pkgIdx:
+    let line = lines[j]
+    let stripped = line.strip()
+    if stripped.len == 0:
+      outBefore.add(line)
+      continue
+    if not stripped.startsWith("//"):
+      outBefore.add(line)
+      continue
+    let afterSlashes = stripped[2 .. ^1].strip(leading = true)
+    if afterSlashes.len == 0:
+      outBefore.add(line)
+      continue
+    if afterSlashes.startsWith("gor-requires:"):
+      let rest = afterSlashes[len("gor-requires:") .. ^1].strip()
+      if rest.len == 0:
+        stderr.writeLine "[gor] gor-requires: empty value"
+        quit(1)
+      for piece in rest.split(','):
+        let entry = piece.strip()
+        if entry.len == 0:
+          stderr.writeLine "[gor] gor-requires: empty module entry"
+          quit(1)
+        for c in entry:
+          if c in Whitespace:
+            stderr.writeLine "[gor] gor-requires: module must be a single token: ", entry
+            quit(1)
+        if not (entry.contains('.') or entry.contains('/')):
+          stderr.writeLine "[gor] gor-requires: expected full module path: ", entry
+          quit(1)
+        result.requires.add(entry)
+      continue
+    if afterSlashes.startsWith("gor-flags:"):
+      inc flagsLines
+      if flagsLines > 1:
+        stderr.writeLine "[gor] gor-flags: only one directive is allowed"
+        quit(1)
+      let rest = afterSlashes[len("gor-flags:") .. ^1].strip()
+      if rest.len == 0:
+        stderr.writeLine "[gor] gor-flags: empty value"
+        quit(1)
+      for tok in rest.splitWhitespace():
+        if tok.len == 0:
+          stderr.writeLine "[gor] gor-flags: empty flag token"
+          quit(1)
+        result.buildFlags.add(tok)
+      continue
+    if afterSlashes.startsWith("gor-"):
+      let colon = afterSlashes.find(':')
+      if colon > 0:
+        stderr.writeLine "[gor] unknown directive: ", stripped
+        quit(1)
+    outBefore.add(line)
+  let tail = lines[pkgIdx .. ^1]
+  if outBefore.len == 0:
+    result.normalizedSource = tail.join("\n")
+  else:
+    result.normalizedSource = outBefore.join("\n") & "\n" & tail.join("\n")
+
+
 ## Runs ``cmd`` with ``args`` in ``workingDir`` and returns the exit code.
 proc coreProcessExitCodeWait(cmd: string; args: openArray[string]; workingDir: string): int =
   let p = startProcess(cmd, args = args, workingDir = workingDir, options = {poParentStreams})
@@ -306,8 +409,10 @@ gor run <script.go> [args...]
 """.strip()
 
 
-## ``go mod init`` + ``go mod tidy`` + ``go build`` in ``workDir``; writes ``binaryPath``.
-proc runGoCompile(workDir: string; binaryPath: string; hashHex: string): int =
+## ``go mod init``, optional ``go get`` for ``requires``, ``go mod tidy``, then ``go build`` with
+## ``buildFlags``; writes ``binaryPath``.
+proc runGoCompile(workDir: string; binaryPath: string; hashHex: string;
+    requires, buildFlags: seq[string]): int =
   let goExe = findExe("go")
   if goExe.len == 0:
     stderr.writeLine "[gor] go is not on PATH"
@@ -322,10 +427,15 @@ proc runGoCompile(workDir: string; binaryPath: string; hashHex: string): int =
   var code = coreProcessExitCodeWait(goExe, @["mod", "init", modName], workDir)
   if code != 0:
     return code
+  for spec in requires:
+    code = coreProcessExitCodeWait(goExe, @["get", spec], workDir)
+    if code != 0:
+      return code
   code = coreProcessExitCodeWait(goExe, @["mod", "tidy"], workDir)
   if code != 0:
     return code
-  coreProcessExitCodeWait(goExe, @["build", "-o", binaryPath, "main.go"], workDir)
+  var buildArgs = @["build"] & buildFlags & @["-o", binaryPath, "main.go"]
+  coreProcessExitCodeWait(goExe, buildArgs, workDir)
 
 
 ## Executes ``binary`` and forwards ``args``, then quits with the child exit code.
@@ -334,6 +444,44 @@ proc runBinaryExec(binary: string; args: openArray[string]) =
   let code = waitForExit(p)
   close(p)
   quit(code)
+
+
+## Reads ``scriptAndArgs``, parses directives, compiles on cache miss, then runs the cached binary.
+proc runScriptCompileAndExec(scriptAndArgs: seq[string]) =
+  if scriptAndArgs.len == 0:
+    stderr.writeLine "[gor] run: expected <script> [args...]"
+    quit(1)
+  let script = scriptAndArgs[0]
+  let args =
+    if scriptAndArgs.len > 1:
+      scriptAndArgs[1 .. ^1]
+    else:
+      @[]
+  let scriptPath = expandFilename(absolutePath(script))
+  if not fileExists(scriptPath):
+    stderr.writeLine "[gor] not a file: ", scriptPath
+    quit(1)
+  let raw = readFile(scriptPath)
+  let meta = runScriptMetaParse(raw)
+  let hashHex = $secureHash(runScriptHashInputGet(
+    meta.normalizedSource, meta.requires, meta.buildFlags))
+  let binaryPath = cacheBinaryPathGet(hashHex)
+  if fileExists(binaryPath):
+    cacheBinaryLastUseTouch(binaryPath)
+    runBinaryExec(binaryPath, args)
+  let tmpRoot = getTempDir() / ("gor-build-" & hashHex[0 ..< 16])
+  createDir(tmpRoot)
+  let mainGo = tmpRoot / "main.go"
+  writeFile(mainGo, meta.normalizedSource)
+  let code = runGoCompile(tmpRoot, binaryPath, hashHex, meta.requires, meta.buildFlags)
+  try:
+    removeDir(tmpRoot)
+  except CatchableError:
+    discard
+  if code != 0:
+    quit(code)
+  cacheStaleBinaryRemove(cacheDirGorGet())
+  runBinaryExec(binaryPath, args)
 
 
 ## Removes the gor content-hash cache directory.
@@ -350,96 +498,9 @@ proc gorCacheClearHandle(ctx: CliContext) =
   stderr.writeLine "[gor] cleared ", dir
 
 
-## Compiles and runs a Go script.
+## Compiles and runs a Go script (shared pipeline for ``run`` and fallback ``run``).
 proc gorRunHandle(ctx: CliContext) =
-  let scriptAndArgs = ctx.args
-
-  if scriptAndArgs.len == 0:
-    stderr.writeLine "[gor] run: expected <script> [args...]"
-    quit(1)
-
-  let script = scriptAndArgs[0]
-  let args =
-    if scriptAndArgs.len > 1:
-      scriptAndArgs[1 .. ^1]
-    else:
-      @[]
-
-  let scriptPath = expandFilename(absolutePath(script))
-  if not fileExists(scriptPath):
-    stderr.writeLine "[gor] not a file: ", scriptPath
-    quit(1)
-
-  let raw = readFile(scriptPath)
-  let normalized = coreNormalizeForHash(raw)
-  let hashHex = $secureHash(normalized)
-  let binaryPath = cacheBinaryPathGet(hashHex)
-
-  if fileExists(binaryPath):
-    cacheBinaryLastUseTouch(binaryPath)
-    runBinaryExec(binaryPath, args)
-
-  let tmpRoot = getTempDir() / ("gor-build-" & hashHex[0 ..< 16])
-  createDir(tmpRoot)
-  let mainGo = tmpRoot / "main.go"
-  writeFile(mainGo, normalized)
-
-  let code = runGoCompile(tmpRoot, binaryPath, hashHex)
-  try:
-    removeDir(tmpRoot)
-  except CatchableError:
-    discard
-  if code != 0:
-    quit(code)
-
-  cacheStaleBinaryRemove(cacheDirGorGet())
-  runBinaryExec(binaryPath, args)
-
-
-## Compiles when the content-hash cache misses, then runs the cached binary.
-## Remaining tokens are forwarded to the compiled program unchanged.
-proc runExecute(scriptAndArgs: seq[string]) =
-
-  if scriptAndArgs.len == 0:
-    stderr.writeLine "[gor] run: expected <script> [args...]"
-    quit(1)
-
-  let script = scriptAndArgs[0]
-  let args =
-    if scriptAndArgs.len > 1:
-      scriptAndArgs[1 .. ^1]
-    else:
-      @[]
-
-  let scriptPath = expandFilename(absolutePath(script))
-  if not fileExists(scriptPath):
-    stderr.writeLine "[gor] not a file: ", scriptPath
-    quit(1)
-
-  let raw = readFile(scriptPath)
-  let normalized = coreNormalizeForHash(raw)
-  let hashHex = $secureHash(normalized)
-  let binaryPath = cacheBinaryPathGet(hashHex)
-
-  if fileExists(binaryPath):
-    cacheBinaryLastUseTouch(binaryPath)
-    runBinaryExec(binaryPath, args)
-
-  let tmpRoot = getTempDir() / ("gor-build-" & hashHex[0 ..< 16])
-  createDir(tmpRoot)
-  let mainGo = tmpRoot / "main.go"
-  writeFile(mainGo, normalized)
-
-  let code = runGoCompile(tmpRoot, binaryPath, hashHex)
-  try:
-    removeDir(tmpRoot)
-  except CatchableError:
-    discard
-  if code != 0:
-    quit(code)
-
-  cacheStaleBinaryRemove(cacheDirGorGet())
-  runBinaryExec(binaryPath, args)
+  runScriptCompileAndExec(ctx.args)
 
 
 const
@@ -463,7 +524,7 @@ const
         name: "completion",
         zshTail: coreCliSurfaceZshTailNestedWords,
         nestedWords: @["zsh"],
-        usageLine: "completions-zsh"),
+        usageLine: "completion zsh"),
     ],
   )
   ## Zsh completion script for ``gor`` (from ``gorCoreCliSurface``).

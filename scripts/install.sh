@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Build gor, install the binary to ~/.local/bin, and write zsh completion to
-# ~/.zsh/completions/_gor via `gor completion zsh`.
+# ~/.zsh/completions/_gor via the built-in `completion zsh` command.
 # Run from anywhere; paths are resolved from this script.
 #
 # Usage:
