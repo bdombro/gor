@@ -39,6 +39,7 @@ main() {
   echo "install.sh: installed ${local_bin}/gor"
 
   "${local_bin}/gor" completion zsh > ~/.zsh/completions/_gor
+  "${local_bin}/gor" cache-clear
 }
 
 main "$@"

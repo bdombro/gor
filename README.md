@@ -54,7 +54,7 @@ gor
 gor -h
 gor run -h
 gor run script.go [args...]
-gor cacheClear
+gor cache-clear
 gor completion zsh > ~/.zsh/completions/_gor
 ```
 
