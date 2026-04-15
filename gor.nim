@@ -8,7 +8,7 @@
     gor -h
     gor run -h
     gor run script.go [args...]
-    gor cacheClear
+    gor cache-clear
     gor completions-zsh
 
   ``gor run -h`` applies only when no script path is given (otherwise ``-h`` is forwarded to the
@@ -455,10 +455,10 @@ const
         nestedWords: @[],
         usageLine: "run <script.go> [args...]"),
       CoreCliSurfaceTopCmd(
-        name: "cacheClear",
+        name: "cache-clear",
         zshTail: coreCliSurfaceZshTailNone,
         nestedWords: @[],
-        usageLine: "cacheClear"),
+        usageLine: "cache-clear"),
       CoreCliSurfaceTopCmd(
         name: "completion",
         zshTail: coreCliSurfaceZshTailNestedWords,
@@ -471,7 +471,7 @@ const
 
 
 ## Main entry: ``cliFallbackWhenUnknown`` so ``gor`` alone prints help and ``gor main.go`` runs
-## ``run`` without spelling ``run`` (``cacheClear`` and flags still explicit).
+## ``run`` without spelling ``run`` (``cache-clear`` and flags still explicit).
 when isMainModule:
   let ps = commandLineParams()
   if ps.len >= 1 and ps[0] == "run":
@@ -482,7 +482,7 @@ when isMainModule:
     CliSchema(
       commands: @[
         cliLeaf(
-          "cacheClear",
+          "cache-clear",
           "Remove the gor content-hash cache directory.",
           gorCacheClearHandle,
         ),
