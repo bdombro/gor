@@ -6,4 +6,4 @@ license = "MIT"
 bin = @["gor"]
 
 requires "nim >= 2.0.0"
-requires "argsbarg >= 1.3.2"
+requires "argsbarg >= 1.4.0"

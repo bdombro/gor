@@ -1,50 +1,71 @@
-# gor: Single-file Go runner
+# gor
 
-Run Go files with a script-like workflow, fast reruns, less setup friction, and **auto-downloads dependencies**. `gor` stores compiled binaries under `~/.cache/gor/` in a **v2** layout: one subdirectory per script whose name encodes the absolute path (`v2__root__Users__…`, path segments joined with `__`, unusual characters percent-encoded and `_` as `%5F`). Inside that directory the executable is named `s_<bytes>_t_<unix>` (whole-second mtime only). When the directory name would exceed ~220 bytes, `gor` uses `v2__long__<8-hex-crc>` instead. A **warm** run reuses the cached binary when path, size, and whole-second mtime match (no temp `go.mod` work). On a **cache miss**, `gor` writes `main.go` into a temp module, runs `go mod init` / optional `go get` / `go mod tidy` / `go build`, then removes the temp tree. After a successful rebuild, older `s_*_t_*` leaves for the same script path are removed automatically. `gor cache-clear` deletes the entire cache tree (including any legacy flat files from older versions).
+**gor** runs a single Go source file like a script: add a shebang, make it executable, and run it. It keeps a **cache of compiled binaries** under `~/.cache/gor/`, so repeat runs are fast. You can declare extra modules in the file; gor runs `go get` for you when the cache is rebuilt.
 
-Vs. (`go run`, (gorun)[https://github.com/erning/gorun]), `gor` supports the same features PLUS **auto-downloads dependencies**. It's kinda like using a shebang `#!/usr/bin/env gorun`, but will automatically `go get` any dependencies.
+Written in Nim with a warm path that **`execv`s** the cached binary (see [Benchmark](#benchmark)).
 
-Vs. (scriptisto)[https://github.com/igor-petruk/scriptisto], much better DevEx, less fragile, less verbose. scriptisto needs a lot more in-file config, and renaming the file or moving it can make it break.
+**Platform:** Unix / POSIX only (macOS, Linux, etc.).
 
-Written in Nim for low startup overhead (see [Benchmark](#benchmark)).
+---
 
-Note: A warm `gor` run still does more work than executing a pre-built Go binary directly (path/size/mtime check, then `execv` into the cached ELF); see [Benchmark](#benchmark) for rough numbers on this machine.
+## How it works
 
-Also checkout my similar tools:
-- [mojor](https://github.com/bdombro/mojor) for Mojo
-- [nimr](https://github.com/bdombro/nimr) for Nim
+**Warm run** — If a cached executable already matches your script’s absolute path, size, and whole-second modification time, gor checks that and hands off to the binary. No temporary `go.mod` work.
+
+**Cold run** — gor copies your source into a temp directory as `main.go`, runs `go mod init`, optional `go get` (from directives), `go mod tidy`, and `go build`, writes the binary into the cache, then runs it. The temp directory is removed afterward.
+
+**Cache layout (v2)** — Under `~/.cache/gor/`, each script gets a directory whose name encodes its path (`v2__…`, segments joined with `__`, odd characters percent-encoded). The binary inside is named `s_<bytes>_t_<unix>` (size and mtime). If that path would be too long (~220 bytes), gor uses `v2__long__<8-hex-crc>` instead. After a successful rebuild, older `s_*_t_*` files for the same script path are deleted.
+
+**Clearing the cache** — `gor cache-clear` removes the whole tree. You can also delete `~/.cache/gor` manually.
+
+---
+
+## Compared to other tools
+
+- **[gorun](https://github.com/erning/gorun)** — Similar “script a `.go` file” idea. gor adds **declarative `go get`** via comments and a path/size/mtime cache keyed by the real file path.
+
+- **[scriptisto](https://github.com/igor-petruk/scriptisto)** — Often more config in the file and more moving parts. gor aims for a smaller surface: mostly normal Go plus a few `//` directives.
+
+- **`go run`** — Handy for one-offs; gor is aimed at **repeatable runs** and **cached** binaries plus optional auto-dependencies.
+
+A warm gor run still does more than running a pre-built binary directly (stat cache key, then `execv`). Numbers are in [Benchmark](#benchmark).
+
+**Similar projects:** [mojor](https://github.com/bdombro/mojor) (Mojo) · [nimr](https://github.com/bdombro/nimr) (Nim)
+
+---
 
 ## Benchmark
 
-We have a hyperfine benchmark (`./scripts/bench.sh`) to measure the cost of using `gor` vs alternatives:
+`./scripts/bench.sh` uses [hyperfine](https://github.com/sharkdp/hyperfine) to compare wall time for a tiny program:
 
-1. `compiled` - A fully compiled Go app ran directly
-2. `gor` - A warm `gor` run that reuses an already-built cached binary
-3. `gorun` - A script that uses `gorun` to compile and run
+| What | Meaning |
+|------|---------|
+| `compiled` | Same program as a normal `go build` binary |
+| `gor` | Warm gor (cache hit, then exec) |
+| `gorun` | Same program behind `gorun` |
+| `scriptisto` | Same program behind scriptisto |
 
-**Notes**
+Warmups run first, so the numbers are mostly **warm-cache** behavior, not first compile.
 
-The most important number in the results is the minimum time per app.
+Example minimums from one checkout:
 
-`hyperfine` warmups run before the measured samples, so this benchmark mostly reflects warm-cache behavior. That means it captures the overhead of `gor`'s metadata check and exec path after the binary is already cached, not the first compile.
+1. `compiled` — 4.4 ms  
+2. `gor` — 10 ms  
+3. `gorun` — 11.2 ms  
+4. `scriptisto` — 11.3 ms  
 
-**Results**
+Run `./scripts/bench.sh` on your machine to refresh.
 
-Measured on this checkout, the minimum times were:
+---
 
-1. `compiled` - 4.4ms
-2. `gor` - 10ms
-3. `gorun` - 11.2ms
-3. `scriptisto` - 11.3ms
+## Quick start
 
-Run `./scripts/bench.sh` locally to compare the current checkout on your machine.
+1. Put **`gor`** on your `PATH` ([Install](#install)).
+2. Start your file with `#!/usr/bin/env gor`.
+3. `chmod +x yourfile` and run `./yourfile`.
 
+Example ([gor-stat](./examples/gor-stat)):
 
-## Usage
-
-Just chmod +x, add a shebang (`#!/usr/bin/env gor`), and run the file (needs `gor` on `PATH`) like [gor-stat](./examples/gor-stat)!
-
-Your script, `foo`:
 ```go
 #!/usr/bin/env gor
 // gor-requires: github.com/spf13/cobra
@@ -65,16 +86,20 @@ func main() {
 
 ```sh
 chmod +x foo
-./foo   # prints "foo"
+./foo
 ```
 
-## More features
+---
 
-### Script directives (`gor-requires`, `gor-flags`)
+## Script directives (`gor-requires`, `gor-flags`)
 
-Near the top of your file (before `package`), you can add `//` line comments that `gor` reads before building. They affect the **temporary build module only**—your script file on disk is never modified. The on-disk cache is keyed by the script’s **absolute path, file size, and whole-second mtime** (see the v2 layout in the intro). Saving the file updates size and/or mtime, so directive and source edits pick up on the next run. Same-second, same-size changes may reuse an existing binary until the clock advances or the size changes. The same source at two different paths produces two cache group directories; moving or copying the file counts as a new path.
+Before `package`, you can use `//` comments that gor reads when building. They only affect the **temporary build**; your file on disk is unchanged.
 
-**`gor-requires`** — run `go get <spec>` for each comma-separated module after `go mod init` and before `go mod tidy`. Use full module paths (must contain `.` or `/`). You may use several `gor-requires:` lines; entries append. Pin a version with `@`:
+**Cache key** — Absolute path, file size, and **whole-second** mtime. Saving the file usually triggers a rebuild. Same second + same size can still hit an old binary until mtime or size changes. Two paths to the same bytes get two cache entries.
+
+### `gor-requires`
+
+After `go mod init`, gor runs `go get` for each comma-separated module (full path with `.` or `/`). Multiple `gor-requires:` lines append. Use `@version` to pin.
 
 ```go
 #!/usr/bin/env gor
@@ -96,7 +121,9 @@ func main() {
 }
 ```
 
-**`gor-flags`** — extra arguments passed only to `go build` (not to your program at runtime). Whitespace-separated tokens; only **one** `gor-flags:` line is allowed.
+### `gor-flags`
+
+Extra arguments **only** for `go build`. Whitespace-separated. **One** `gor-flags:` line allowed.
 
 ```go
 // gor-flags: -tags=prod -ldflags=-s
@@ -106,44 +133,44 @@ package main
 func main() {}
 ```
 
-Malformed directives, unknown `gor-*` names, empty values, or a second `gor-flags` line cause `gor` to exit with an error.
+Bad directives, unknown `gor-*` names, empty values, or a second `gor-flags` line make gor exit with an error.
 
-### IDE Integration
+---
 
-For VSCode and similar to auto-choose the Go language when scripts don't end with ".go":
-
-1. Install the [Shebang Language Association extension](https://marketplace.visualstudio.com/items?itemName=davidhewitt.shebang-language-associator)
-2. Add the following to your VSCode JSON settings:
-
-```json
-  "shebang.associations": [
-    {
-      "pattern": "^#!/usr/bin/env gor$",
-      "language": "go"
-    }
-  ],
-```
-
-
-### CLI overview:
+## Command line
 
 ```text
-gor
 gor -h
-gor run -h
-gor run script.go [args...]
+gor run -h                    # only when no script path (else -h goes to your program)
+gor run <script.go> [args...]
+gor <script.go> [args...]     # same as “gor run …” (fallback)
 gor cache-clear
 gor completion zsh > ~/.zsh/completions/_gor
 ```
 
-Use `gor run -h` only when there is no script path (otherwise `-h` is passed through to your program).
+---
 
+## IDE tip (VS Code)
+
+To treat shebang scripts as Go when the filename is not `*.go`:
+
+1. Install [Shebang Language Associator](https://marketplace.visualstudio.com/items?itemName=davidhewitt.shebang-language-associator).
+2. In settings JSON:
+
+```json
+"shebang.associations": [
+  {
+    "pattern": "^#!/usr/bin/env gor$",
+    "language": "go"
+  }
+]
+```
+
+---
 
 ## Install
 
-Use precompiled binaries from the [releases](https://github.com/bdombro/gor/releases) page, or build from source (see **Building** below).
-
-To quickly install the latest **Apple Silicon** (aarch64) macOS build with `curl`:
+**Release binary** — See [GitHub releases](https://github.com/bdombro/gor/releases). Example for **Apple Silicon** macOS (adjust if your asset name differs):
 
 ```sh
 curl -sSL https://api.github.com/repos/bdombro/gor/releases/latest | grep -Eo 'https://[^"]*aarch64-apple-darwin[^"]*\.zip' | head -1 | xargs curl -sSL -o gor.zip
@@ -152,43 +179,36 @@ mv gor ~/.local/bin/
 rm gor.zip
 ```
 
-Assumes `~/.local/bin` is on your `PATH`.
+Put `~/.local/bin` on your `PATH` if needed.
 
-From a clone, build and install the binary to `~/.local/bin/gor` and write a zsh completion file:
+**From a clone** — builds `dist/gor`, copies to `~/.local/bin/gor`, and writes zsh completion:
 
 ```sh
 just install
 # or: ./scripts/install.sh
 ```
 
-That copies `dist/gor` to `~/.local/bin/gor`, then runs `gor completion zsh` with stdout redirected to `~/.zsh/completions/_gor` (creating that directory first if needed). The install script does **not** edit `~/.zshrc`; you must put that directory on zsh `fpath` **before** `compinit` (see below).
+The script does **not** edit `~/.zshrc`. Add `~/.zsh/completions` to **`fpath` before `compinit`** (see below).
 
+---
 
-## Completions
+## Shell completion (zsh)
 
-### Zsh (file-based `_gor`)
-
-Generate the completion script on **stdout** (from argsbarg), then save it yourself:
+Generate the completion script (stdout from argsbarg), then save it:
 
 ```sh
 mkdir -p ~/.zsh/completions
 gor completion zsh > ~/.zsh/completions/_gor
 ```
 
-The `just install` / `./scripts/install.sh` path does the same redirect after building `dist/gor`.
-
-Put **`~/.zsh/completions` on `fpath` before `compinit`**. For example in `~/.zshrc`:
+In `~/.zshrc` (before Oh My Zsh if you use it):
 
 ```zsh
 fpath=(~/.zsh/completions $fpath)
 autoload -Uz compinit && compinit
 ```
 
-If you use **Oh My Zsh**, add the `fpath` line before Oh My Zsh is sourced (or wherever your theme loads `compinit`).
-
-**Release binary only:** run the built-in `completion zsh` command after installing the binary, then configure `fpath` as above.
-
-**Refresh if TAB seems stale**
+If completion feels stale:
 
 ```zsh
 rm -f ~/.zcompdump*
@@ -197,12 +217,13 @@ autoload -Uz compinit && compinit
 
 ### Bash
 
-Often needs the `bash-completion` package for `_longopt`:
+With `bash-completion` installed, a simple option is:
 
 ```bash
 complete -F _longopt gor
 ```
 
+---
 
 ## Building
 
@@ -211,19 +232,20 @@ just build
 # or: ./scripts/build.sh
 ```
 
-Cross-compiled release zips (macOS host + Linux glibc) live under `dist/`:
+**Cross-compiled zips** (macOS host + Linux glibc) under `dist/`:
 
 ```sh
 just build-cross dev
 ```
 
-GitHub release (requires pre-built zips for that version in `dist/`):
+**Release** (needs matching zips already in `dist/`):
 
 ```sh
 just release v1.2.3
 # or: ./scripts/build-cross.sh v1.2.3 && ./scripts/release.sh v1.2.3
 ```
 
+---
 
 ## License
 

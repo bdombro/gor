@@ -42,6 +42,7 @@ main() {
   set -x
   "${local_bin}/gor" completion zsh > "${HOME}/.zsh/completions/_gor"
   "${dist_bin}" cache-clear
+  rm -rf "${HOME}/.nimble/bin/gor" 2>/dev/null || true
   set +x
 }
 
