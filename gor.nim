@@ -78,7 +78,7 @@ type
     size: int64
 
 type
-  ## Parsed ``gor-requires`` / ``gor-flags`` directives plus the ``main.go`` body (directives stripped).
+  ## Parsed ``requires`` / ``flags`` directives plus the ``main.go`` body (directives stripped).
   RunScriptMeta = object
     ## Extra tokens passed to ``go build`` only (not to the compiled program).
     buildFlags: seq[string]
@@ -283,7 +283,7 @@ proc runScriptLinePackageIs(line: string): bool =
   parts.len >= 1 and parts[0] == "package"
 
 
-## Parses ``gor-requires`` / ``gor-flags`` from leading ``//`` lines before ``package``; strips those lines
+## Parses ``requires`` / ``flags`` from leading ``//`` lines before ``package``; strips those lines
 ## from the source written to ``main.go``. Quits on malformed or unknown directives.
 proc runScriptMetaParse(raw: string): RunScriptMeta =
   let body = coreShebangStrip(raw)
@@ -314,37 +314,37 @@ proc runScriptMetaParse(raw: string): RunScriptMeta =
     if afterSlashes.len == 0:
       outBefore.add(line)
       continue
-    if afterSlashes.startsWith("gor-requires:"):
-      let rest = afterSlashes[len("gor-requires:") .. ^1].strip()
+    if afterSlashes.startsWith("requires:"):
+      let rest = afterSlashes[len("requires:") .. ^1].strip()
       if rest.len == 0:
-        stderr.writeLine "[gor] gor-requires: empty value"
+        stderr.writeLine "[gor] requires: empty value"
         quit(1)
       for piece in rest.split(','):
         let entry = piece.strip()
         if entry.len == 0:
-          stderr.writeLine "[gor] gor-requires: empty module entry"
+          stderr.writeLine "[gor] requires: empty module entry"
           quit(1)
         for c in entry:
           if c in Whitespace:
-            stderr.writeLine "[gor] gor-requires: module must be a single token: ", entry
+            stderr.writeLine "[gor] requires: module must be a single token: ", entry
             quit(1)
         if not (entry.contains('.') or entry.contains('/')):
-          stderr.writeLine "[gor] gor-requires: expected full module path: ", entry
+          stderr.writeLine "[gor] requires: expected full module path: ", entry
           quit(1)
         result.requires.add(entry)
       continue
-    if afterSlashes.startsWith("gor-flags:"):
+    if afterSlashes.startsWith("flags:"):
       inc flagsLines
       if flagsLines > 1:
-        stderr.writeLine "[gor] gor-flags: only one directive is allowed"
+        stderr.writeLine "[gor] flags: only one directive is allowed"
         quit(1)
-      let rest = afterSlashes[len("gor-flags:") .. ^1].strip()
+      let rest = afterSlashes[len("flags:") .. ^1].strip()
       if rest.len == 0:
-        stderr.writeLine "[gor] gor-flags: empty value"
+        stderr.writeLine "[gor] flags: empty value"
         quit(1)
       for tok in rest.splitWhitespace():
         if tok.len == 0:
-          stderr.writeLine "[gor] gor-flags: empty flag token"
+          stderr.writeLine "[gor] flags: empty flag token"
           quit(1)
         result.buildFlags.add(tok)
       continue

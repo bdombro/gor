@@ -68,7 +68,7 @@ Example ([gor-stat](./examples/gor-stat)):
 
 ```go
 #!/usr/bin/env gor
-// gor-requires: github.com/spf13/cobra
+// requires: github.com/spf13/cobra
 
 package main
 
@@ -91,20 +91,20 @@ chmod +x foo
 
 ---
 
-## Script directives (`gor-requires`, `gor-flags`)
+## Script directives (`requires`, `flags`)
 
 Before `package`, you can use `//` comments that gor reads when building. They only affect the **temporary build**; your file on disk is unchanged.
 
 **Cache key** — Absolute path, file size, and **whole-second** mtime. Saving the file usually triggers a rebuild. Same second + same size can still hit an old binary until mtime or size changes. Two paths to the same bytes get two cache entries.
 
-### `gor-requires`
+### `requires`
 
-After `go mod init`, gor runs `go get` for each comma-separated module (full path with `.` or `/`). Multiple `gor-requires:` lines append. Use `@version` to pin.
+After `go mod init`, gor runs `go get` for each comma-separated module (full path with `.` or `/`). Multiple `requires:` lines append. Use `@version` to pin.
 
 ```go
 #!/usr/bin/env gor
-// gor-requires: rsc.io/quote
-// gor-requires: github.com/spf13/cobra@v1.8.0
+// requires: rsc.io/quote
+// requires: github.com/spf13/cobra@v1.8.0
 
 package main
 
@@ -121,19 +121,19 @@ func main() {
 }
 ```
 
-### `gor-flags`
+### `flags`
 
-Extra arguments **only** for `go build`. Whitespace-separated. **One** `gor-flags:` line allowed.
+Extra arguments **only** for `go build`. Whitespace-separated. **One** `flags:` line allowed.
 
 ```go
-// gor-flags: -tags=prod -ldflags=-s
+// flags: -tags=prod -ldflags=-s
 
 package main
 
 func main() {}
 ```
 
-Bad directives, unknown `gor-*` names, empty values, or a second `gor-flags` line make gor exit with an error.
+Bad directives, unknown directive names, empty values, or a second `flags` line make gor exit with an error.
 
 ---
 

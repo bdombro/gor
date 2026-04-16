@@ -1,6 +1,5 @@
 #!/usr/bin/env gor
-
-// gor-requires: gonum.org/v1/gonum
+// requires: gonum.org/v1/gonum
 
 /*
 Gonum + gor
