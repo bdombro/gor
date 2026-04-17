@@ -1,5 +1,7 @@
 # gor
 
+**NOTICE** This app has been merged into my multi-language app -- https://github.com/bdombro/shebangsy
+
 **gor** runs a single Go source file like a script: add a shebang, make it executable, and run it. It keeps a **cache of compiled binaries** under `~/.cache/gor/`, so repeat runs are fast. You can declare extra modules in the file; gor runs `go get` for you when the cache is rebuilt.
 
 Written in Nim with a warm path that **`execv`s** the cached binary (see [Benchmark](#benchmark)).
